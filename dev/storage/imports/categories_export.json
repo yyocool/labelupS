@@ -1,0 +1,79 @@
+[
+    {
+        "name": "물류관리용/주소용/바코드용/인덱스용",
+        "slug": "logistics-label",
+        "image_path": "/assets/categories/cat_logistics-label.webp",
+        "sort_order": 1,
+        "is_active": 1
+    },
+    {
+        "name": "정부문서화일 라벨",
+        "slug": "government-doc",
+        "image_path": "/assets/categories/cat_government-doc.webp",
+        "sort_order": 2,
+        "is_active": 1
+    },
+    {
+        "name": "광택 라벨",
+        "slug": "gloss-label",
+        "image_path": "/assets/categories/cat_gloss-label.webp",
+        "sort_order": 3,
+        "is_active": 1
+    },
+    {
+        "name": "방수 라벨",
+        "slug": "waterproof-label",
+        "image_path": "/assets/categories/cat_waterproof-label.webp",
+        "sort_order": 4,
+        "is_active": 1
+    },
+    {
+        "name": "반투명 라벨",
+        "slug": "translucent-label",
+        "image_path": "/assets/categories/cat_translucent-label.webp",
+        "sort_order": 5,
+        "is_active": 1
+    },
+    {
+        "name": "잉크젯 투명 라벨",
+        "slug": "inkjet-clear-label",
+        "image_path": "/assets/categories/cat_inkjet-clear-label.webp",
+        "sort_order": 6,
+        "is_active": 1
+    },
+    {
+        "name": "레이저 투명 라벨",
+        "slug": "laser-clear-label",
+        "image_path": "/assets/categories/cat_laser-clear-label.webp",
+        "sort_order": 7,
+        "is_active": 1
+    },
+    {
+        "name": "보호용 필름",
+        "slug": "protective-film",
+        "image_path": "/assets/categories/cat_protective-film.webp",
+        "sort_order": 8,
+        "is_active": 1
+    },
+    {
+        "name": "컬러 라벨(형광)",
+        "slug": "color-label",
+        "image_path": "/assets/categories/cat_color-label.webp",
+        "sort_order": 9,
+        "is_active": 1
+    },
+    {
+        "name": "파스텔 컬러 라벨",
+        "slug": "pastel-color-label",
+        "image_path": "/assets/categories/cat_pastel-color-label.webp",
+        "sort_order": 10,
+        "is_active": 1
+    },
+    {
+        "name": "크라프트 라벨",
+        "slug": "kraft-label",
+        "image_path": "/assets/categories/cat_kraft-label.webp",
+        "sort_order": 11,
+        "is_active": 1
+    }
+]

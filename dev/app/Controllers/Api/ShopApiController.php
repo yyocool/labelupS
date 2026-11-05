@@ -1,0 +1,261 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Controllers\Api;
+
+use App\Controllers\BaseController;
+use App\Middleware\AuthMiddleware;
+use App\Services\AuthService;
+use App\Services\ShopService;
+use App\Services\ShopWishlistService;
+use RuntimeException;
+
+final class ShopApiController extends BaseController
+{
+    private ShopService $shop;
+
+    public function __construct()
+    {
+        $this->shop = new ShopService();
+    }
+
+    public function editorPapers(): never
+    {
+        $this->jsonSuccess($this->shop->editorPapers());
+    }
+
+    public function catalog(): never
+    {
+        $q = trim((string) ($_GET['q'] ?? ''));
+        $category = trim((string) ($_GET['category'] ?? ''));
+        $page = max(1, (int) ($_GET['page'] ?? 1));
+        $filters = array_filter([
+            'q' => $q,
+            'category_slug' => $category,
+        ]);
+        $this->jsonSuccess($this->shop->catalog($filters, $page, 12));
+    }
+
+    public function product(string $id): never
+    {
+        $product = $this->shop->productDetail((int) $id);
+        if (!$product) {
+            $this->jsonError('상품을 찾을 수 없습니다.', null, 404);
+        }
+        // 목록 응답에는 옵션을 싣지 않는다(N+1). 상세에서만 내려준다.
+        $payload = $this->shop->presentPublicProduct($product);
+        $payload['options'] = $this->shop->productOptions($product);
+        $layout = $this->shop->productPageLayout((int) ($product['category_id'] ?? 0));
+        $payload['hashtags'] = $layout['hashtags'];
+        $this->jsonSuccess($payload);
+    }
+
+    public function lookup(): never
+    {
+        $code = trim((string) ($_GET['code'] ?? ''));
+        if ($code === '') {
+            $this->jsonError('용지 번호를 입력해 주세요.', null, 422);
+        }
+        $width = isset($_GET['w']) && $_GET['w'] !== '' ? (float) $_GET['w'] : null;
+        $height = isset($_GET['h']) && $_GET['h'] !== '' ? (float) $_GET['h'] : null;
+        $labels = isset($_GET['labels']) && $_GET['labels'] !== '' ? (int) $_GET['labels'] : null;
+        $product = $this->shop->lookupByCode($code, $width, $height, $labels);
+        if (!$product) {
+            $this->jsonError('현재 용지에 맞는 상품이 없습니다.', null, 404);
+        }
+        $this->jsonSuccess($product);
+    }
+
+    public function checkout(): never
+    {
+        $auth = new AuthService();
+        $user = $auth->user();
+        if (!$user) {
+            $this->jsonError('로그인이 필요합니다.', null, 401);
+        }
+        $data = $this->withCartMode(request_json());
+        try {
+            $order = $this->shop->checkout($data, $user);
+            $this->jsonSuccess($order, '주문이 접수되었습니다.');
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    public function cart(): never
+    {
+        $this->withCartMode([]);
+        $this->jsonSuccess($this->shop->cartSummary());
+    }
+
+    /**
+     * 요청에 mode=buy 가 있으면 장바구니 대신 바로구매 줄을 다룬다.
+     *
+     * @param array<string, mixed> $data
+     * @return array<string, mixed>
+     */
+    private function withCartMode(array $data): array
+    {
+        $mode = (string) ($data['mode'] ?? $_GET['mode'] ?? '');
+        $this->shop->useBuyNow($mode === 'buy');
+        return $data;
+    }
+
+    public function buyNow(): never
+    {
+        $data = request_json();
+        try {
+            $this->shop->startBuyNow(
+                (int) ($data['product_id'] ?? 0),
+                (int) ($data['qty'] ?? 1),
+                (int) ($data['option_id'] ?? 0)
+            );
+            $this->jsonSuccess(['redirect' => url('shop/cart') . '?mode=buy']);
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    public function wishlist(): never
+    {
+        $auth = new AuthService();
+        (new AuthMiddleware($auth))->handle();
+        $userId = (int) $auth->id();
+        $wish = new ShopWishlistService();
+        $this->jsonSuccess([
+            'items' => $wish->items($userId),
+            'count' => $wish->count($userId),
+        ]);
+    }
+
+    public function toggleWishlist(): never
+    {
+        $auth = new AuthService();
+        (new AuthMiddleware($auth))->handle();
+        $data = request_json();
+        try {
+            $result = (new ShopWishlistService())->toggle(
+                (int) $auth->id(),
+                (int) ($data['product_id'] ?? 0)
+            );
+            $this->jsonSuccess(
+                $result,
+                $result['wished'] ? '찜 목록에 담았습니다.' : '찜 목록에서 뺐습니다.'
+            );
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    public function removeWishlist(): never
+    {
+        $auth = new AuthService();
+        (new AuthMiddleware($auth))->handle();
+        $data = request_json();
+        $count = (new ShopWishlistService())->remove(
+            (int) $auth->id(),
+            (int) ($data['product_id'] ?? 0)
+        );
+        $this->jsonSuccess(['wished' => false, 'count' => $count], '찜 목록에서 뺐습니다.');
+    }
+
+    public function addCart(): never
+    {
+        $data = request_json();
+        try {
+            $this->shop->addToCart(
+                (int) ($data['product_id'] ?? 0),
+                (int) ($data['qty'] ?? 1),
+                (int) ($data['option_id'] ?? 0)
+            );
+            $this->jsonSuccess($this->shop->cartSummary(), '장바구니에 담았습니다.');
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    public function updateCart(): never
+    {
+        $data = $this->withCartMode(request_json());
+        try {
+            $this->shop->updateCartItem(
+                (int) ($data['product_id'] ?? 0),
+                (int) ($data['qty'] ?? 0),
+                (int) ($data['option_id'] ?? 0)
+            );
+            $this->jsonSuccess($this->shop->cartSummary(), '장바구니가 수정되었습니다.');
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    public function removeCart(): never
+    {
+        $data = $this->withCartMode(request_json());
+        $this->shop->removeFromCart(
+            (int) ($data['product_id'] ?? 0),
+            (int) ($data['option_id'] ?? 0)
+        );
+        $this->jsonSuccess($this->shop->cartSummary(), '상품을 삭제했습니다.');
+    }
+
+    public function applyCoupon(): never
+    {
+        $data = $this->withCartMode(request_json());
+        try {
+            $this->jsonSuccess(
+                $this->shop->applyCoupon((string) ($data['code'] ?? '')),
+                '쿠폰이 적용되었습니다.'
+            );
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    public function selectCoupon(): never
+    {
+        $data = request_json();
+        try {
+            $picked = $this->shop->selectCoupon((string) ($data['code'] ?? ''));
+            $this->jsonSuccess($picked, $picked['notice']);
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    public function removeCoupon(): never
+    {
+        $this->withCartMode(request_json());
+        $this->jsonSuccess($this->shop->removeCoupon(), '쿠폰이 해제되었습니다.');
+    }
+
+    public function paymentMethods(): never
+    {
+        $toss = new \App\Services\TossPaymentsService();
+        $this->jsonSuccess([
+            'enabled' => $toss->isEnabled(),
+            'configured' => $toss->isConfigured(),
+            'provider' => 'toss',
+            'methods' => $toss->availableMethods(),
+        ]);
+    }
+
+    public function preparePayment(): never
+    {
+        $auth = new AuthService();
+        $user = $auth->user();
+        if (!$user) {
+            $this->jsonError('로그인이 필요합니다.', null, 401);
+        }
+        $data = request_json();
+        $orderNo = trim((string) ($data['order_no'] ?? $_GET['order_no'] ?? ''));
+        $source = trim((string) ($data['source'] ?? 'shop'));
+        try {
+            $payment = $this->shop->paymentPayloadForOrder($orderNo, (int) ($user['id'] ?? 0), $source !== '' ? $source : 'shop');
+            $this->jsonSuccess(['payment' => $payment, 'order_no' => $orderNo]);
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+}

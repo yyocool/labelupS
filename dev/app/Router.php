@@ -1,0 +1,578 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App;
+
+use App\Controllers\AdminController;
+use App\Controllers\Api\CreditAdminApiController;
+use App\Controllers\Api\CreditApiController;
+use App\Controllers\Api\LegalApiController;
+use App\Controllers\Api\ShopAdminApiController;
+use App\Controllers\Api\ShopApiController;
+use App\Controllers\ContentAdminController;
+use App\Controllers\Api\ContentAdminApiController;
+use App\Controllers\CreditAdminController;
+use App\Controllers\EventPopupAdminController;
+use App\Controllers\Api\EventPopupAdminApiController;
+use App\Controllers\FaqAdminController;
+use App\Controllers\Api\FaqAdminApiController;
+use App\Controllers\FaqController;
+use App\Controllers\ReviewAdminController;
+use App\Controllers\Api\ReviewAdminApiController;
+use App\Controllers\Api\ShopReviewApiController;
+use App\Controllers\HeroAdminController;
+use App\Controllers\Api\HeroAdminApiController;
+use App\Controllers\MidBannerAdminController;
+use App\Controllers\Api\MidBannerAdminApiController;
+use App\Controllers\ShopAdminController;
+use App\Controllers\ShopController;
+use App\Controllers\ShopPaymentController;
+use App\Controllers\Api\AdminApiController;
+use App\Controllers\Api\AdminWorkspaceApiController;
+use App\Controllers\Api\InquiryApiController;
+use App\Controllers\InquiryAdminController;
+use App\Controllers\ErrorReportAdminController;
+use App\Controllers\Api\ErrorReportApiController;
+use App\Controllers\AdminAccountController;
+use App\Controllers\Api\AdminAccountApiController;
+use App\Controllers\AiAdminController;
+use App\Controllers\Api\AiAdminApiController;
+use App\Controllers\Api\AiChatApiController;
+use App\Controllers\Api\AiExamplePromptApiController;
+use App\Controllers\Api\AccountAddressApiController;
+use App\Controllers\Api\NotificationApiController;
+use App\Controllers\Api\EditorTemplateApiController;
+use App\Controllers\Api\EditorRemoteImageApiController;
+use App\Controllers\Api\EditorIlabelExcelApiController;
+use App\Controllers\Api\EditorSystemFontApiController;
+use App\Controllers\Api\EditorClipartApiController;
+use App\Controllers\Api\EditorPaperApiController;
+use App\Controllers\Api\EditorWorkspaceApiController;
+use App\Controllers\Api\LibraryApiController;
+use App\Controllers\LibraryController;
+use App\Controllers\Api\HealthController;
+use App\Controllers\Api\SeedController;
+use App\Controllers\Api\SystemController;
+use App\Controllers\AuthController;
+use App\Controllers\HomeController;
+use App\Controllers\AboutController;
+use App\Controllers\LegalPublicController;
+use App\Controllers\SeoAdminController;
+use App\Controllers\SeoPublicController;
+use App\Controllers\Api\SeoAdminApiController;
+use App\Controllers\SiteIntroAdminController;
+use App\Controllers\Api\SiteIntroAdminApiController;
+use App\Controllers\SiteModeAdminController;
+use App\Controllers\Api\SiteModeAdminApiController;
+use App\Controllers\Api\OpenAiBillingAdminApiController;
+use App\Controllers\NotifySmsAdminController;
+use App\Controllers\Api\NotifySmsAdminApiController;
+use App\Controllers\Api\SiteRuntimeApiController;
+use App\Services\SiteModeService;
+use App\Controllers\MemberGradeAdminController;
+use App\Controllers\Api\MemberGradeAdminApiController;
+use App\Controllers\PartnerPortalController;
+use App\Controllers\PartnerAdminController;
+use App\Controllers\Api\PartnerAdminApiController;
+use App\Controllers\QrCouponAdminController;
+use App\Controllers\Api\QrCouponAdminApiController;
+use App\Controllers\QrCouponPublicController;
+use App\Controllers\CompatCodePublicController;
+use App\Controllers\QaReviewController;
+use App\Controllers\Api\QaReviewApiController;
+use App\Controllers\LaunchChecklistPublicController;
+use App\Controllers\Api\LaunchChecklistApiController;
+
+final class Router
+{
+    /** @var array<int, array{method:string,pattern:string,handler:callable}> */
+    private array $routes = [];
+
+    public function get(string $pattern, callable $handler): self
+    {
+        return $this->add('GET', $pattern, $handler);
+    }
+
+    public function post(string $pattern, callable $handler): self
+    {
+        return $this->add('POST', $pattern, $handler);
+    }
+
+    public function options(string $pattern, callable $handler): self
+    {
+        return $this->add('OPTIONS', $pattern, $handler);
+    }
+
+    private function add(string $method, string $pattern, callable $handler): self
+    {
+        $this->routes[] = compact('method', 'pattern', 'handler');
+        return $this;
+    }
+
+    public function dispatch(string $method, string $uri): void
+    {
+        $path = parse_url($uri, PHP_URL_PATH) ?: '/';
+        if (preg_match('#^/public/(.+)$#', $path, $publicMatch) === 1) {
+            $rel = str_replace('\\', '/', $publicMatch[1]);
+            if (!str_contains($rel, '..') && is_file(public_path($rel))) {
+                $query = parse_url($uri, PHP_URL_QUERY);
+                redirect('/' . $rel . ($query ? ('?' . $query) : ''));
+            }
+        }
+        $path = rtrim($path, '/') ?: '/';
+        $this->enforceMaintenanceIfNeeded($path);
+
+        foreach ($this->routes as $route) {
+            if ($route['method'] !== strtoupper($method)) {
+                continue;
+            }
+
+            $regex = '#^' . preg_replace('#\{([a-zA-Z_][a-zA-Z0-9_]*)\}#', '(?P<$1>[^/]+)', $route['pattern']) . '$#';
+            if (!preg_match($regex, $path, $matches)) {
+                continue;
+            }
+
+            $params = array_filter($matches, static fn ($key) => !is_int($key), ARRAY_FILTER_USE_KEY);
+            ($route['handler'])(...array_values($params));
+            return;
+        }
+
+        http_response_code(404);
+        if (str_starts_with($path, '/api/')) {
+            \App\Helpers\ApiResponse::error('Not Found', null, 404);
+        }
+        try {
+            if ((new SeoPublicController())->tryServeFile($path)) {
+                return;
+            }
+        } catch (\Throwable) {
+        }
+        view('errors/404');
+    }
+
+    private function enforceMaintenanceIfNeeded(string $path): void
+    {
+        try {
+            $siteMode = new SiteModeService();
+            if (!$siteMode->isMaintenance()) {
+                return;
+            }
+            if ($siteMode->isBypassPath($path)) {
+                return;
+            }
+            // 관리자 세션이어도 공개 페이지는 유지보수 화면을 본다.
+            // (/admin · /api/admin 만 isBypassPath 로 통과)
+        } catch (\Throwable) {
+            return;
+        }
+
+        http_response_code(503);
+        if (str_starts_with($path, '/api/')) {
+            \App\Helpers\ApiResponse::error('현재 사이트 점검 중입니다. 잠시 후 다시 시도해 주세요.', [
+                'code' => 'maintenance',
+            ], 503);
+        }
+        view('errors/maintenance', [
+            'siteMode' => (new SiteModeService())->adminPayload(),
+        ]);
+        exit;
+    }
+
+    public static function register(): self
+    {
+        $router = new self();
+        $home = new HomeController();
+        $about = new AboutController();
+        $legalPublic = new LegalPublicController();
+        $auth = new AuthController();
+        $admin = new AdminController();
+        $health = new HealthController();
+        $system = new SystemController();
+        $seed = new SeedController();
+        $editorWorkspaceApi = new EditorWorkspaceApiController();
+        $library = new LibraryController();
+        $libraryApi = new LibraryApiController();
+        $aiChatApi = new AiChatApiController();
+        $aiPromptsPublic = new AiExamplePromptApiController();
+        $aiAdmin = new AiAdminController();
+        $aiAdminApi = new AiAdminApiController();
+        $adminApi = new AdminApiController();
+        $adminWorkspaceApi = new AdminWorkspaceApiController();
+        $inquiryAdmin = new InquiryAdminController();
+        $inquiryApi = new InquiryApiController();
+        $errorReportAdmin = new ErrorReportAdminController();
+        $errorReportApi = new ErrorReportApiController();
+        $adminAccount = new AdminAccountController();
+        $adminAccountApi = new AdminAccountApiController();
+        $legalApi = new LegalApiController();
+        $shop = new ShopAdminController();
+        $shopApi = new ShopAdminApiController();
+        $creditAdmin = new CreditAdminController();
+        $creditAdminApi = new CreditAdminApiController();
+        $creditApi = new CreditApiController();
+        $heroAdmin = new HeroAdminController();
+        $heroAdminApi = new HeroAdminApiController();
+        $midBannerAdmin = new MidBannerAdminController();
+        $midBannerAdminApi = new MidBannerAdminApiController();
+        $eventPopupAdmin = new EventPopupAdminController();
+        $eventPopupAdminApi = new EventPopupAdminApiController();
+        $faqAdmin = new FaqAdminController();
+        $faqAdminApi = new FaqAdminApiController();
+        $faqPublic = new FaqController();
+        $reviewAdmin = new ReviewAdminController();
+        $reviewAdminApi = new ReviewAdminApiController();
+        $reviewPublicApi = new ShopReviewApiController();
+        $contentAdmin = new ContentAdminController();
+        $contentAdminApi = new ContentAdminApiController();
+        $editorTemplateApi = new EditorTemplateApiController();
+        $editorRemoteImageApi = new EditorRemoteImageApiController();
+        $editorIlabelExcelApi = new EditorIlabelExcelApiController();
+        $editorSystemFontApi = new EditorSystemFontApiController();
+        $editorClipartApi = new EditorClipartApiController();
+        $editorPaperApi = new EditorPaperApiController();
+        $shopPublic = new ShopController();
+        $shopPayment = new ShopPaymentController();
+        $shopPublicApi = new ShopApiController();
+        $accountAddressApi = new AccountAddressApiController();
+        $notificationApi = new NotificationApiController();
+        $seoAdmin = new SeoAdminController();
+        $seoAdminApi = new SeoAdminApiController();
+        $seoPublic = new SeoPublicController();
+        $introAdmin = new SiteIntroAdminController();
+        $introAdminApi = new SiteIntroAdminApiController();
+        $siteModeAdmin = new SiteModeAdminController();
+        $siteModeAdminApi = new SiteModeAdminApiController();
+        $openAiBillingApi = new OpenAiBillingAdminApiController();
+        $notifySmsAdmin = new NotifySmsAdminController();
+        $notifySmsApi = new NotifySmsAdminApiController();
+        $siteRuntimeApi = new SiteRuntimeApiController();
+        $memberGradeAdmin = new MemberGradeAdminController();
+        $memberGradeAdminApi = new MemberGradeAdminApiController();
+        $partnerPortal = new PartnerPortalController();
+        $partnerAdmin = new PartnerAdminController();
+        $partnerAdminApi = new PartnerAdminApiController();
+        $qrCouponAdmin = new QrCouponAdminController();
+        $qrCouponAdminApi = new QrCouponAdminApiController();
+        $qrCouponPublic = new QrCouponPublicController();
+        $compatPublic = new CompatCodePublicController();
+        $qaReview = new QaReviewController();
+        $qaReviewApi = new QaReviewApiController();
+        $launchChecklist = new LaunchChecklistPublicController();
+        $launchChecklistApi = new LaunchChecklistApiController();
+
+        $router->get('/', [$home, 'index']);
+        $router->get('/about', [$about, 'index']);
+        $router->get('/service', [$about, 'index']);
+        $router->get('/launch-checklist', [$launchChecklist, 'index']);
+        $router->get('/open-checklist', [$launchChecklist, 'index']);
+        $router->get('/api/launch-checklist', [$launchChecklistApi, 'show']);
+        $router->post('/api/launch-checklist', [$launchChecklistApi, 'save']);
+        $router->post('/api/launch-checklist/reset', [$launchChecklistApi, 'reset']);
+        $router->get('/terms', [$legalPublic, 'terms']);
+        $router->get('/privacy', [$legalPublic, 'privacy']);
+        $router->get('/faq', [$faqPublic, 'index']);
+        $router->get('/compat', [$compatPublic, 'index']);
+        $router->get('/compat-codes', [$compatPublic, 'index']);
+        $router->get('/compat/qr', [$compatPublic, 'qrSample']);
+        $router->get('/compat-codes/qr', [$compatPublic, 'qrSample']);
+        $router->get('/qr-coupon', [$qrCouponPublic, 'index']);
+        $router->get('/qr-coupon/{code}', [$qrCouponPublic, 'show']);
+
+        $router->get('/shop', [$shopPublic, 'index']);
+        $router->get('/shop/products', [$shopPublic, 'products']);
+        $router->get('/shop/products/{id}', [$shopPublic, 'product']);
+        $router->get('/shop/cart', [$shopPublic, 'cart']);
+        $router->get('/shop/complete', [$shopPublic, 'complete']);
+        $router->get('/shop/pay/success', [$shopPayment, 'success']);
+        $router->get('/shop/pay/fail', [$shopPayment, 'fail']);
+
+        $router->get('/login', [$auth, 'loginForm']);
+        $router->get('/register', [$auth, 'registerForm']);
+        $router->get('/register/phone', [$auth, 'socialPhoneForm']);
+        $router->get('/reset-password', [$auth, 'resetPasswordForm']);
+        $router->get('/account', [$auth, 'account']);
+        $router->get('/account/orders', [$auth, 'accountOrders']);
+        $router->get('/account/orders/{orderNo}', [$auth, 'accountOrder']);
+        $router->get('/account/coupons', [$auth, 'accountCoupons']);
+        $router->get('/projects', [$library, 'projects']);
+        $router->get('/locker', [$library, 'locker']);
+        $router->get('/trash', [$library, 'trash']);
+        $router->get('/logout', [$auth, 'logout']);
+        $router->get('/auth/{provider}', [$auth, 'oauthRedirect']);
+        $router->get('/auth/{provider}/callback', [$auth, 'oauthCallback']);
+
+        $router->get('/admin/login', [$admin, 'loginForm']);
+        $router->get('/admin/logout', [$admin, 'logout']);
+        $router->get('/admin/qa-review', [$qaReview, 'index']);
+        $router->post('/api/admin/qa-review/save', [$qaReviewApi, 'save']);
+        $router->post('/api/admin/qa-review/upload-image', [$qaReviewApi, 'uploadImage']);
+        $router->get('/admin', [$admin, 'dashboard']);
+        $router->get('/admin/users', [$admin, 'users']);
+        $router->get('/admin/users/{id}', [$admin, 'userDetail']);
+        $router->get('/admin/settings', [$admin, 'settings']);
+        $router->get('/admin/settings/admins', [$adminAccount, 'index']);
+        $router->get('/admin/settings/member-grades', [$memberGradeAdmin, 'index']);
+        $router->get('/admin/settings/seo', [$seoAdmin, 'seo']);
+        $router->get('/admin/settings/tracking', [$seoAdmin, 'marketing']);
+        $router->get('/admin/settings/intro', [$introAdmin, 'index']);
+        $router->get('/admin/settings/environment', [$siteModeAdmin, 'index']);
+        $router->get('/admin/settings/notify-sms', [$notifySmsAdmin, 'index']);
+        $router->get('/partner/login', [$partnerPortal, 'loginForm']);
+        $router->post('/partner/login', [$partnerPortal, 'login']);
+        $router->get('/partner/logout', [$partnerPortal, 'logout']);
+        $router->get('/partner', [$partnerPortal, 'home']);
+        $router->get('/partner/images', [$partnerPortal, 'images']);
+        $router->post('/partner/images/download', [$partnerPortal, 'download']);
+        $router->get('/partner/images/download/{id}', [$partnerPortal, 'downloadOne']);
+        $router->get('/admin/partners', [$partnerAdmin, 'index']);
+        $router->post('/api/admin/partners/save', [$partnerAdminApi, 'save']);
+        $router->post('/api/admin/partners/reset-password', [$partnerAdminApi, 'resetPassword']);
+        $router->post('/api/admin/partners/delete', [$partnerAdminApi, 'delete']);
+
+        $router->get('/robots.txt', [$seoPublic, 'robots']);
+        $router->get('/sitemap.xml', [$seoPublic, 'sitemap']);
+        $router->get('/ads.txt', [$seoPublic, 'adsTxt']);
+        $router->get('/app-ads.txt', [$seoPublic, 'appAdsTxt']);
+
+        $router->get('/admin/ops/credit-grants', [$creditAdmin, 'creditGrants']);
+        $router->get('/admin/ops/credit-rewards', [$creditAdmin, 'rewardRules']);
+        $router->get('/admin/ops/credit-usage', [$creditAdmin, 'creditUsage']);
+        $router->get('/admin/ops/purchase-credits', [$creditAdmin, 'purchaseCredits']);
+        $router->get('/admin/ops/hero-slides', [$heroAdmin, 'index']);
+        $router->get('/admin/ops/mid-banners', [$midBannerAdmin, 'index']);
+        $router->get('/admin/ops/event-popups', [$eventPopupAdmin, 'index']);
+        $router->get('/admin/ops/faq', [$faqAdmin, 'index']);
+        $router->get('/admin/ops/reviews', [$reviewAdmin, 'index']);
+        $router->get('/admin/ops/inquiries', [$inquiryAdmin, 'index']);
+        $router->get('/admin/ops/error-reports', [$errorReportAdmin, 'index']);
+        $router->get('/admin/qr-coupons', [$qrCouponAdmin, 'index']);
+        $router->post('/api/admin/qr-coupons/credit/save', [$qrCouponAdminApi, 'saveCredit']);
+        $router->post('/api/admin/qr-coupons/generate', [$qrCouponAdminApi, 'generate']);
+        $router->post('/api/admin/qr-coupons/generation-history', [$qrCouponAdminApi, 'generationHistory']);
+        $router->post('/api/admin/qr-coupons/batch-codes', [$qrCouponAdminApi, 'batchCodes']);
+        $router->post('/api/admin/qr-coupons/group-codes', [$qrCouponAdminApi, 'groupCodes']);
+        $router->post('/api/admin/qr-coupons/mark-printed', [$qrCouponAdminApi, 'markPrinted']);
+        $router->post('/api/admin/qr-coupons/delete-codes', [$qrCouponAdminApi, 'deleteCodes']);
+        $router->post('/api/admin/qr-coupons/usage-history', [$qrCouponAdminApi, 'usageHistory']);
+        $router->get('/api/admin/qr-coupons/print-template', [$qrCouponAdminApi, 'printTemplate']);
+        $router->post('/api/admin/qr-coupons/print-template/save', [$qrCouponAdminApi, 'savePrintTemplate']);
+        $router->get('/admin/ai/example-prompts', [$aiAdmin, 'examplePrompts']);
+        $router->get('/admin/ai/credit-settings', [$aiAdmin, 'creditSettings']);
+        $router->get('/admin/ai/token-logs', [$aiAdmin, 'tokenLogs']);
+        $router->get('/admin/ai/token-logs/export', [$aiAdmin, 'tokenLogsExport']);
+        $router->get('/admin/ai/member-usage', [$aiAdmin, 'memberUsage']);
+        $router->get('/admin/ai/usage', [$aiAdmin, 'usage']);
+        $router->get('/admin/content/cliparts', [$contentAdmin, 'cliparts']);
+        $router->get('/admin/content/user-designs', [$contentAdmin, 'userDesigns']);
+        $router->get('/admin/content/templates', [$contentAdmin, 'templates']);
+        $router->get('/admin/content/product-detail-pages', [$contentAdmin, 'productDetailPages']);
+        $router->get('/admin/content/product-detail-pages/preview/{id}', [$contentAdmin, 'productDetailPreview']);
+        $router->get('/admin/content/product-detail-pages/images/{id}', [$contentAdmin, 'productDetailImages']);
+
+        $router->get('/admin/shop/categories', [$shop, 'categories']);
+        $router->get('/admin/shop/specs', [$shop, 'specs']);
+        $router->get('/admin/shop/products', [$shop, 'products']);
+        $router->get('/admin/shop/orders', [$shop, 'orders']);
+        $router->get('/admin/shop/orders/export', [$shop, 'ordersExport']);
+        $router->get('/admin/shop/shipping', [$shop, 'shipping']);
+        $router->get('/admin/shop/coupons', [$shop, 'coupons']);
+        $router->get('/admin/shop/banners', [$shop, 'banners']);
+
+        $router->get('/api/health', [$health, 'index']);
+        $router->post('/api/system/migrate', [$system, 'migrate']);
+        $router->post('/api/system/seed-admin', [$seed, 'admin']);
+
+        $router->get('/api/legal/{key}', [$legalApi, 'show']);
+
+        $router->post('/api/auth/register', [$auth, 'apiRegister']);
+        $router->post('/api/auth/phone/send', [$auth, 'apiSendPhoneCode']);
+        $router->post('/api/auth/phone/verify', [$auth, 'apiVerifyPhoneCode']);
+        $router->post('/api/auth/oauth/complete', [$auth, 'apiCompleteSocialSignup']);
+        $router->post('/api/auth/login', [$auth, 'apiLogin']);
+        $router->post('/api/auth/logout', [$auth, 'apiLogout']);
+        $router->get('/api/auth/me', [$auth, 'apiMe']);
+        $router->get('/api/auth/oauth', [$auth, 'oauthProviders']);
+        $router->post('/api/auth/oauth/google', [$auth, 'googleTokenLogin']);
+        $router->get('/api/credit/me', [$creditApi, 'me']);
+        $router->get('/api/notifications', [$notificationApi, 'index']);
+        $router->get('/api/notifications/unread', [$notificationApi, 'unread']);
+        $router->post('/api/notifications/read', [$notificationApi, 'markRead']);
+        $router->get('/api/notifications/prefs', [$notificationApi, 'prefs']);
+        $router->post('/api/notifications/prefs', [$notificationApi, 'savePrefs']);
+        $router->get('/api/auth/check-email', [$auth, 'apiCheckEmail']);
+        $router->post('/api/auth/profile', [$auth, 'apiUpdateProfile']);
+        $router->post('/api/auth/password', [$auth, 'apiChangePassword']);
+        $router->post('/api/auth/withdraw', [$auth, 'apiWithdraw']);
+        $router->post('/api/auth/find-email', [$auth, 'apiFindEmail']);
+        $router->post('/api/auth/password-reset/request', [$auth, 'apiRequestPasswordReset']);
+        $router->post('/api/auth/password-reset/confirm', [$auth, 'apiResetPassword']);
+
+        $router->get('/api/editor/papers', [$editorPaperApi, 'index']);
+        $router->options('/api/editor/papers', [$editorPaperApi, 'preflight']);
+        $router->get('/api/editor/workspaces', [$editorWorkspaceApi, 'index']);
+        $router->get('/api/editor/workspace', [$editorWorkspaceApi, 'show']);
+        $router->post('/api/editor/workspace', [$editorWorkspaceApi, 'save']);
+        $router->post('/api/library/trash', [$libraryApi, 'trash']);
+        $router->post('/api/library/restore', [$libraryApi, 'restore']);
+        $router->post('/api/library/purge', [$libraryApi, 'purge']);
+        $router->get('/api/editor/templates', [$editorTemplateApi, 'index']);
+        $router->get('/api/editor/templates/{id}', [$editorTemplateApi, 'show']);
+        $router->get('/api/editor/remote-image', [$editorRemoteImageApi, 'show']);
+        $router->get('/api/editor/ilabel-excel', [$editorIlabelExcelApi, 'show']);
+        $router->get('/api/editor/system-font', [$editorSystemFontApi, 'show']);
+        $router->get('/api/editor/cliparts', [$editorClipartApi, 'index']);
+        $router->get('/api/editor/my-cliparts', [$editorClipartApi, 'mine']);
+
+        $router->post('/api/ai/chat', [$aiChatApi, 'chat']);
+        $router->get('/api/ai/example-prompts', [$aiPromptsPublic, 'index']);
+
+        $router->post('/api/admin/ai/example-prompt/save', [$aiAdminApi, 'savePrompt']);
+        $router->post('/api/admin/ai/example-prompt/delete', [$aiAdminApi, 'deletePrompt']);
+        $router->post('/api/admin/ai/credit-settings/save', [$aiAdminApi, 'saveCreditSettings']);
+
+        $router->get('/api/admin/favorites', [$adminWorkspaceApi, 'favorites']);
+        $router->post('/api/admin/favorites', [$adminWorkspaceApi, 'saveFavorites']);
+        $router->get('/api/admin/alerts', [$adminWorkspaceApi, 'alerts']);
+        $router->post('/api/admin/alerts/ack', [$adminWorkspaceApi, 'ackAlerts']);
+        $router->post('/api/inquiry', [$inquiryApi, 'submit']);
+        $router->post('/api/error-reports', [$errorReportApi, 'submit']);
+        $router->get('/api/admin/error-reports', [$errorReportApi, 'detail']);
+        $router->post('/api/admin/error-reports/process', [$errorReportApi, 'process']);
+        $router->post('/api/admin/inquiry/update', [$inquiryApi, 'update']);
+
+        $router->get('/api/admin/admins/lookup', [$adminAccountApi, 'lookup']);
+        $router->post('/api/admin/admins/save', [$adminAccountApi, 'save']);
+        $router->post('/api/admin/admins/revoke', [$adminAccountApi, 'revoke']);
+        $router->post('/api/admin/member-grades/save', [$memberGradeAdminApi, 'save']);
+        $router->post('/api/admin/member-grades/delete', [$memberGradeAdminApi, 'delete']);
+        $router->post('/api/admin/seo/save', [$seoAdminApi, 'saveSeo']);
+        $router->post('/api/admin/seo/page', [$seoAdminApi, 'savePage']);
+        $router->post('/api/admin/marketing/save', [$seoAdminApi, 'saveMarketing']);
+        $router->post('/api/admin/marketing/file', [$seoAdminApi, 'saveFile']);
+        $router->post('/api/admin/marketing/file/delete', [$seoAdminApi, 'deleteFile']);
+        $router->post('/api/admin/intro/save', [$introAdminApi, 'save']);
+        $router->post('/api/admin/intro/upload', [$introAdminApi, 'upload']);
+        $router->post('/api/admin/site-mode/save', [$siteModeAdminApi, 'save']);
+        $router->post('/api/admin/ai-settings/save', [$siteModeAdminApi, 'saveAi']);
+        $router->post('/api/admin/naver-sms/save', [$siteModeAdminApi, 'saveNaverSms']);
+        $router->get('/api/admin/openai-billing/summary', [$openAiBillingApi, 'summary']);
+        $router->post('/api/admin/openai-billing/save', [$openAiBillingApi, 'saveConfig']);
+        $router->post('/api/admin/openai-billing/topup', [$openAiBillingApi, 'addTopup']);
+        $router->post('/api/admin/openai-billing/topup/delete', [$openAiBillingApi, 'deleteTopup']);
+        $router->post('/api/admin/notify-sms/save', [$notifySmsApi, 'save']);
+        $router->post('/api/admin/notify-sms/test', [$notifySmsApi, 'test']);
+        $router->get('/api/site/runtime', [$siteRuntimeApi, 'runtime']);
+
+        $router->post('/api/admin/login', [$adminApi, 'login']);
+        $router->post('/api/admin/password', [$adminApi, 'changePassword']);
+        $router->post('/api/admin/users/create', [$adminApi, 'createUser']);
+        $router->post('/api/admin/users/update', [$adminApi, 'updateUser']);
+        $router->post('/api/admin/users/reveal', [$adminApi, 'revealUser']);
+        $router->post('/api/admin/legal/update', [$adminApi, 'updateLegal']);
+
+        $router->post('/api/admin/credit/reward/save', [$creditAdminApi, 'saveRewardRule']);
+        $router->post('/api/admin/credit/reward/delete', [$creditAdminApi, 'deleteRewardRule']);
+        $router->post('/api/admin/credit/purchase-product/save', [$creditAdminApi, 'savePurchaseProduct']);
+        $router->post('/api/admin/credit/purchase-product/delete', [$creditAdminApi, 'deletePurchaseProduct']);
+        $router->post('/api/admin/credit/purchase-group/credit/save', [$creditAdminApi, 'savePurchaseGroupCredit']);
+        $router->post('/api/admin/credit/purchase-group/usage-history', [$creditAdminApi, 'purchaseGroupUsageHistory']);
+        $router->post('/api/admin/ops/credit-usage/save', [$creditAdminApi, 'saveCreditUsage']);
+        $router->post('/api/admin/credit/codes/generate', [$creditAdminApi, 'generateCodes']);
+        $router->post('/api/admin/credit/adjust', [$creditAdminApi, 'adjustCredit']);
+        $router->post('/api/admin/credit/grant', [$creditAdminApi, 'grantCredit']);
+        $router->get('/api/admin/credit/grants', [$creditAdminApi, 'grantHistory']);
+        $router->get('/api/admin/credit/overview', [$creditAdminApi, 'overview']);
+        $router->post('/api/admin/credit/cs/save', [$creditAdminApi, 'saveCsLog']);
+
+        $router->post('/api/admin/hero/slide/save', [$heroAdminApi, 'save']);
+        $router->post('/api/admin/hero/slide/upload', [$heroAdminApi, 'upload']);
+        $router->post('/api/admin/hero/slide/delete', [$heroAdminApi, 'delete']);
+
+        $router->post('/api/admin/mid-banner/save', [$midBannerAdminApi, 'save']);
+        $router->post('/api/admin/mid-banner/upload', [$midBannerAdminApi, 'upload']);
+        $router->post('/api/admin/mid-banner/delete', [$midBannerAdminApi, 'delete']);
+
+        $router->post('/api/admin/event-popup/save', [$eventPopupAdminApi, 'save']);
+        $router->post('/api/admin/event-popup/delete', [$eventPopupAdminApi, 'delete']);
+
+        $router->post('/api/admin/faq/save', [$faqAdminApi, 'save']);
+        $router->post('/api/admin/reviews/save', [$reviewAdminApi, 'save']);
+        $router->post('/api/admin/reviews/status', [$reviewAdminApi, 'status']);
+        $router->post('/api/admin/reviews/delete', [$reviewAdminApi, 'delete']);
+        $router->post('/api/admin/reviews/settings', [$reviewAdminApi, 'settings']);
+        $router->post('/api/admin/reviews/upload', [$reviewAdminApi, 'upload']);
+        $router->post('/api/admin/faq/delete', [$faqAdminApi, 'delete']);
+        $router->post('/api/admin/faq/category/save', [$faqAdminApi, 'saveCategory']);
+        $router->post('/api/admin/faq/category/delete', [$faqAdminApi, 'deleteCategory']);
+
+        $router->post('/api/admin/content/clipart/save', [$contentAdminApi, 'saveClipart']);
+        $router->post('/api/admin/content/clipart/delete', [$contentAdminApi, 'deleteClipart']);
+        $router->post('/api/admin/content/clipart/upload', [$contentAdminApi, 'uploadClipart']);
+        $router->post('/api/admin/content/clipart/seed', [$contentAdminApi, 'seedCliparts']);
+        $router->post('/api/admin/content/category/save', [$contentAdminApi, 'saveCategory']);
+        $router->post('/api/admin/content/template/save', [$contentAdminApi, 'saveTemplate']);
+        $router->post('/api/admin/content/template/delete', [$contentAdminApi, 'deleteTemplate']);
+        $router->post('/api/admin/content/template/seed', [$contentAdminApi, 'seedTemplates']);
+        $router->post('/api/admin/content/user-design/review', [$contentAdminApi, 'reviewUserDesign']);
+        $router->post('/api/admin/content/user-design/approve-batch', [$contentAdminApi, 'approveUserDesigns']);
+        $router->post('/api/admin/content/user-design/delete', [$contentAdminApi, 'deleteUserDesign']);
+
+        $router->post('/api/admin/shop/category/save', [$shopApi, 'saveCategory']);
+        $router->post('/api/admin/shop/category/upload-images', [$shopApi, 'uploadCategoryImages']);
+        $router->post('/api/admin/shop/category/delete', [$shopApi, 'deleteCategory']);
+        $router->post('/api/admin/shop/spec/save', [$shopApi, 'saveSpec']);
+        $router->post('/api/admin/shop/spec/upload-images', [$shopApi, 'uploadSpecImages']);
+        $router->post('/api/admin/shop/spec/delete', [$shopApi, 'deleteSpec']);
+        $router->post('/api/admin/shop/product/save', [$shopApi, 'saveProduct']);
+        $router->post('/api/admin/shop/product/upload-images', [$shopApi, 'uploadProductImages']);
+        $router->post('/api/admin/shop/product/delete', [$shopApi, 'deleteProduct']);
+        $router->post('/api/admin/shop/product/compat-save', [$shopApi, 'saveProductCompat']);
+        $router->post('/api/admin/shop/order/update', [$shopApi, 'updateOrder']);
+        $router->post('/api/admin/shop/order/detail', [$shopApi, 'orderDetail']);
+        $router->post('/api/admin/shop/order/bulk', [$shopApi, 'bulkUpdateOrders']);
+        $router->post('/api/admin/shop/coupon/save', [$shopApi, 'saveCoupon']);
+        $router->post('/api/admin/shop/coupon/delete', [$shopApi, 'deleteCoupon']);
+        $router->post('/api/admin/shop/banner/save', [$shopApi, 'saveBanner']);
+        $router->post('/api/admin/shop/banner/delete', [$shopApi, 'deleteBanner']);
+        $router->post('/api/admin/shop/banner/upload-images', [$shopApi, 'uploadBannerImages']);
+        $router->get('/api/admin/shop/product-page-settings', [$shopApi, 'productPageSettings']);
+        $router->post('/api/admin/shop/product-page-settings/save', [$shopApi, 'saveProductPageSettings']);
+        $router->post('/api/admin/shop/product-page-settings/upload-images', [$shopApi, 'uploadProductPageImages']);
+        $router->get('/api/admin/shop/product-page-category-settings', [$shopApi, 'productPageCategorySettingsList']);
+        $router->get('/api/admin/shop/product-page-category-settings/one', [$shopApi, 'productPageCategorySettings']);
+        $router->post('/api/admin/shop/product-page-category-settings/save', [$shopApi, 'saveProductPageCategorySettings']);
+        $router->get('/api/admin/shop/product-detail-page', [$shopApi, 'productDetailPage']);
+        $router->post('/api/admin/shop/product-detail-page/save', [$shopApi, 'saveProductDetailPage']);
+
+        $router->get('/api/shop/editor-papers', [$shopPublicApi, 'editorPapers']);
+        $router->get('/api/shop/catalog', [$shopPublicApi, 'catalog']);
+        $router->get('/api/shop/lookup', [$shopPublicApi, 'lookup']);
+        $router->get('/api/shop/products/{id}', [$shopPublicApi, 'product']);
+        $router->get('/api/shop/cart', [$shopPublicApi, 'cart']);
+        $router->post('/api/shop/cart/add', [$shopPublicApi, 'addCart']);
+        $router->post('/api/shop/cart/update', [$shopPublicApi, 'updateCart']);
+        $router->post('/api/shop/cart/remove', [$shopPublicApi, 'removeCart']);
+        $router->post('/api/shop/buy-now', [$shopPublicApi, 'buyNow']);
+        $router->get('/api/shop/reviews', [$reviewPublicApi, 'index']);
+        $router->post('/api/shop/reviews/save', [$reviewPublicApi, 'save']);
+        $router->post('/api/shop/reviews/delete', [$reviewPublicApi, 'delete']);
+        $router->post('/api/shop/reviews/upload', [$reviewPublicApi, 'upload']);
+        $router->post('/api/shop/coupon/apply', [$shopPublicApi, 'applyCoupon']);
+        $router->post('/api/shop/coupon/select', [$shopPublicApi, 'selectCoupon']);
+        $router->post('/api/shop/coupon/remove', [$shopPublicApi, 'removeCoupon']);
+        $router->get('/api/shop/wishlist', [$shopPublicApi, 'wishlist']);
+        $router->post('/api/shop/wishlist/toggle', [$shopPublicApi, 'toggleWishlist']);
+        $router->post('/api/shop/wishlist/remove', [$shopPublicApi, 'removeWishlist']);
+        $router->post('/api/shop/checkout', [$shopPublicApi, 'checkout']);
+        $router->get('/api/shop/pay/methods', [$shopPublicApi, 'paymentMethods']);
+        $router->post('/api/shop/pay/prepare', [$shopPublicApi, 'preparePayment']);
+
+        $router->get('/api/account/addresses', [$accountAddressApi, 'index']);
+        $router->post('/api/account/addresses/save', [$accountAddressApi, 'save']);
+        $router->post('/api/account/addresses/delete', [$accountAddressApi, 'delete']);
+        $router->post('/api/account/addresses/default', [$accountAddressApi, 'setDefault']);
+
+        return $router;
+    }
+}

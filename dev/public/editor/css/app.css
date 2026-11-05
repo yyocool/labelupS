@@ -1,0 +1,16 @@
+html, body {
+  font-family: Pretendard, "Noto Sans KR", sans-serif;
+  width: 100%;
+  max-width: none;
+  margin: 0;
+}
+
+/* 편집기는 쇼핑몰·홈과 달리 1920 폭 제한 없이 화면을 가득 채운다 */
+html, body, #app {
+  min-width: 100%;
+}
+
+/* Blazor WASM sets --blazor-load-percentage / --blazor-load-percentage-text on :root while downloading */
+.loading-progress-text:after {
+  content: var(--blazor-load-percentage-text, "");
+}

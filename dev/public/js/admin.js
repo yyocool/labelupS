@@ -1,0 +1,1008 @@
+const AdminAPI = {
+  async request(path, options = {}) {
+    const res = await fetch(path, {
+      credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
+      ...options,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.success === false) {
+      throw new Error(data.message || '요청 처리 중 오류가 발생했습니다.');
+    }
+    return data;
+  },
+  get(path) {
+    return this.request(path);
+  },
+  post(path, body) {
+    return this.request(path, { method: 'POST', body: JSON.stringify(body) });
+  },
+};
+
+const ADMIN_LNB_KEY = 'labelup_admin_lnb_collapsed';
+
+function initAdminLnbToggle() {
+  const app = document.getElementById('adminApp');
+  const toggle = document.getElementById('adminLnbToggle');
+  if (!app || !toggle) return;
+
+  const applyState = (collapsed) => {
+    app.classList.toggle('is-lnb-collapsed', collapsed);
+    toggle.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    toggle.setAttribute('aria-label', collapsed ? '사이드바 펼치기' : '사이드바 접기');
+    toggle.title = collapsed ? '사이드바 펼치기' : '사이드바 접기';
+  };
+
+  applyState(localStorage.getItem(ADMIN_LNB_KEY) === '1');
+
+  toggle.addEventListener('click', () => {
+    const collapsed = !app.classList.contains('is-lnb-collapsed');
+    applyState(collapsed);
+    localStorage.setItem(ADMIN_LNB_KEY, collapsed ? '1' : '0');
+  });
+}
+
+function showAdminAlert(message, type = 'success') {
+  const el = document.getElementById('adminToast') || document.getElementById('adminAlert');
+  if (!el) return;
+  el.textContent = message;
+  const isToast = el.id === 'adminToast' || el.classList.contains('admin-alert--toast');
+  el.className = isToast
+    ? `admin-alert admin-alert--toast show ${type}`
+    : `admin-alert show ${type}`;
+  window.clearTimeout(showAdminAlert._timer);
+  showAdminAlert._timer = window.setTimeout(() => {
+    el.className = isToast ? 'admin-alert admin-alert--toast' : 'admin-alert';
+  }, 4000);
+}
+
+document.querySelectorAll('[data-user-row] .js-grade, [data-user-row] .js-status').forEach((el) => {
+  el.dataset.prev = el.value;
+  el.addEventListener('change', async () => {
+    const row = el.closest('[data-user-row]');
+    const userId = Number(row?.dataset.userRow || 0);
+    if (!row || !userId || el.disabled) return;
+
+    const previous = el.dataset.prev ?? el.value;
+    const payload = { user_id: userId };
+    if (el.classList.contains('js-grade')) {
+      payload.grade_id = Number(el.value || 0);
+    } else {
+      payload.status = el.value;
+    }
+
+    el.disabled = true;
+    try {
+      await AdminAPI.post('/api/admin/users/update', payload);
+      el.dataset.prev = el.value;
+      showAdminAlert('저장되었습니다.', 'success');
+    } catch (err) {
+      el.value = previous;
+      showAdminAlert(err.message, 'error');
+    } finally {
+      el.disabled = false;
+    }
+  });
+});
+
+/* 회원 관리: 관리자가 회원을 직접 추가하는 창. */
+function initUserCreateUi() {
+  const modal = document.getElementById('userCreateModal');
+  const form = document.getElementById('userCreateForm');
+  const openBtn = document.getElementById('userCreateOpen');
+  if (!modal || !form || !openBtn) return;
+
+  const submitBtn = document.querySelector('[form="userCreateForm"][type=submit]');
+  const close = () => { modal.hidden = true; };
+
+  openBtn.addEventListener('click', () => {
+    form.reset();
+    modal.hidden = false;
+    form.querySelector('[name=email]')?.focus();
+  });
+  modal.querySelectorAll('[data-close="userCreateModal"]').forEach((el) => {
+    el.addEventListener('click', close);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !modal.hidden) close();
+  });
+
+  // 서버 규칙(영문+숫자 8자 이상)을 반드시 만족하는 임시 비밀번호를 만든다.
+  document.getElementById('userCreatePasswordGen')?.addEventListener('click', () => {
+    const letters = 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ';
+    const digits = '23456789';
+    const pick = (chars, n) => Array.from(
+      crypto.getRandomValues(new Uint32Array(n)),
+      (v) => chars[v % chars.length]
+    );
+    const chars = [...pick(letters, 6), ...pick(digits, 4), ...pick('!@#$%', 1)];
+    // 자리별 종류가 고정되지 않도록 섞는다.
+    for (let i = chars.length - 1; i > 0; i--) {
+      const j = crypto.getRandomValues(new Uint32Array(1))[0] % (i + 1);
+      [chars[i], chars[j]] = [chars[j], chars[i]];
+    }
+    const input = document.getElementById('userCreatePassword');
+    if (input) {
+      input.value = chars.join('');
+      input.select();
+    }
+  });
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(form);
+    const payload = Object.fromEntries(fd.entries());
+    payload.grade_id = Number(payload.grade_id || 0);
+    payload.credit_amount = Number(payload.credit_amount || 0);
+    payload.send_welcome = fd.get('send_welcome') ? 1 : 0;
+
+    if (submitBtn) submitBtn.disabled = true;
+    try {
+      const res = await AdminAPI.post('/api/admin/users/create', payload);
+      close();
+      showAdminAlert(res.message || '회원이 추가되었습니다.', 'success');
+      window.location.reload();
+    } catch (err) {
+      showAdminAlert(err.message, 'error');
+    } finally {
+      if (submitBtn) submitBtn.disabled = false;
+    }
+  });
+}
+
+initUserCreateUi();
+
+initAdminLnbToggle();
+
+document.querySelectorAll('.admin-lnb-group-toggle').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    btn.closest('.admin-lnb-group')?.classList.toggle('is-open');
+    btn.setAttribute('aria-expanded', btn.closest('.admin-lnb-group')?.classList.contains('is-open') ? 'true' : 'false');
+  });
+});
+
+const LEGAL_EDITOR_OPTS = {
+  lang: 'ko-KR',
+  height: 360,
+  placeholder: '약관 내용을 입력하세요.',
+  toolbar: [
+    ['style', ['style']],
+    ['font', ['bold', 'italic', 'underline', 'clear']],
+    ['para', ['ul', 'ol', 'paragraph']],
+    ['insert', ['link', 'table', 'hr']],
+    ['view', ['fullscreen', 'codeview']],
+  ],
+};
+
+function isLegalEditorActive(textarea) {
+  return window.jQuery && jQuery(textarea).next('.note-editor').length > 0;
+}
+
+function initLegalEditor(textarea) {
+  if (!window.jQuery || !jQuery.fn.summernote || !textarea) return;
+  const $el = jQuery(textarea);
+  if ($el.next('.note-editor').length) return;
+  $el.summernote(LEGAL_EDITOR_OPTS);
+}
+
+function getLegalEditorContent(textarea) {
+  if (!textarea) return '';
+  if (isLegalEditorActive(textarea)) {
+    return jQuery(textarea).summernote('code') || '';
+  }
+  return textarea.value || '';
+}
+
+function initActiveLegalEditors() {
+  document.querySelectorAll('.admin-legal-panel.is-active .js-legal-editor').forEach(initLegalEditor);
+}
+
+function switchLegalTab(key) {
+  document.querySelectorAll('.admin-legal-tab').forEach((tab) => {
+    tab.classList.toggle('is-active', tab.dataset.tab === key);
+  });
+  document.querySelectorAll('.admin-legal-panel').forEach((panel) => {
+    panel.classList.toggle('is-active', panel.dataset.panel === key);
+  });
+  window.setTimeout(initActiveLegalEditors, 0);
+}
+
+document.querySelectorAll('.admin-legal-tab').forEach((tab) => {
+  tab.addEventListener('click', () => {
+    switchLegalTab(tab.dataset.tab);
+  });
+});
+
+if (document.querySelector('.js-legal-editor')) {
+  initActiveLegalEditors();
+}
+
+document.querySelectorAll('.admin-legal-form').forEach((form) => {
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = form.querySelector('button[type=submit]');
+    const contentEl = form.querySelector('.js-legal-editor');
+    btn.disabled = true;
+    try {
+      const fd = new FormData(form);
+      await AdminAPI.post('/api/admin/legal/update', {
+        doc_key: form.dataset.docKey,
+        title: fd.get('title'),
+        content: getLegalEditorContent(contentEl),
+      });
+      showAdminAlert('약관이 저장되었습니다.', 'success');
+      setTimeout(() => location.reload(), 600);
+    } catch (err) {
+      showAdminAlert(err.message, 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+});
+
+const ADMIN_FS_KEY = 'labelup_admin_fullscreen';
+const ADMIN_ALERT_MS = 25000;
+
+function adminMenuHref(item) {
+  if (!item || !item.href) return '#';
+  if (/^https?:\/\//.test(item.href) || item.href.startsWith('/')) return item.href;
+  return '/' + String(item.href).replace(/^\//, '');
+}
+
+function currentFavSlots() {
+  return Array.isArray(window.LABELUP_ADMIN_FAVS) ? window.LABELUP_ADMIN_FAVS.slice() : [];
+}
+
+function renderAdminFavs(slots) {
+  const root = document.getElementById('adminFavs');
+  const editBtn = root?.querySelector('.js-fav-edit');
+  if (!root || !editBtn) return;
+  root.querySelectorAll('.admin-fav-slot').forEach((el) => el.remove());
+  slots.forEach((slot) => {
+    const n = Number(slot.slot);
+    if (slot.href) {
+      const a = document.createElement('a');
+      a.className = 'admin-fav-slot is-filled';
+      a.href = slot.href;
+      a.title = slot.label || '';
+      a.dataset.slot = String(n);
+      a.dataset.key = slot.menu_key || '';
+      a.innerHTML = '<span class="ic"></span><span class="lbl"></span><button type="button" class="admin-fav-clear js-fav-clear" aria-label="즐겨찾기 제거">×</button>';
+      a.querySelector('.ic').textContent = slot.ic || '★';
+      a.querySelector('.lbl').textContent = slot.label || '';
+      a.querySelector('.js-fav-clear').dataset.slot = String(n);
+      root.insertBefore(a, editBtn);
+    } else {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'admin-fav-slot js-fav-pick';
+      btn.dataset.slot = String(n);
+      btn.title = '즐겨찾기 추가';
+      btn.textContent = '+';
+      root.insertBefore(btn, editBtn);
+    }
+  });
+}
+
+function openAdminFavModal(slotNo) {
+  const modal = document.getElementById('adminFavModal');
+  const body = document.getElementById('adminFavModalBody');
+  const title = document.getElementById('adminFavModalTitle');
+  if (!modal || !body) return;
+  const slots = currentFavSlots();
+  const current = slots.find((s) => Number(s.slot) === slotNo);
+  const used = new Set(slots.filter((s) => s.menu_key).map((s) => s.menu_key));
+  const menus = Array.isArray(window.LABELUP_ADMIN_MENUS) ? window.LABELUP_ADMIN_MENUS : [];
+  const groups = {};
+  menus.forEach((item) => {
+    const g = item.group || '메뉴';
+    if (!groups[g]) groups[g] = [];
+    groups[g].push(item);
+  });
+  if (title) title.textContent = `즐겨찾기 ${slotNo}번 메뉴 선택`;
+  body.innerHTML = '';
+  Object.keys(groups).forEach((group) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'admin-fav-pick-group';
+    const heading = document.createElement('h3');
+    heading.textContent = group;
+    wrap.appendChild(heading);
+    const list = document.createElement('div');
+    list.className = 'admin-fav-pick-list';
+    groups[group].forEach((item) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'admin-fav-pick-item';
+      if (current?.menu_key === item.key) btn.classList.add('is-current');
+      else if (used.has(item.key)) btn.classList.add('is-used');
+      const ic = document.createElement('span');
+      ic.textContent = item.ic || '★';
+      const lb = document.createElement('span');
+      lb.textContent = item.label;
+      btn.append(ic, lb);
+      btn.addEventListener('click', () => assignAdminFav(slotNo, item.key));
+      list.appendChild(btn);
+    });
+    wrap.appendChild(list);
+    body.appendChild(wrap);
+  });
+  if (current?.menu_key) {
+    const clear = document.createElement('button');
+    clear.type = 'button';
+    clear.className = 'admin-btn admin-fav-pick-clear';
+    clear.textContent = '이 칸 비우기';
+    clear.addEventListener('click', () => assignAdminFav(slotNo, ''));
+    body.appendChild(clear);
+  }
+  modal.hidden = false;
+}
+
+function closeAdminFavModal() {
+  const modal = document.getElementById('adminFavModal');
+  if (modal) modal.hidden = true;
+}
+
+async function persistAdminFavs(slots) {
+  const payload = slots
+    .filter((s) => s.menu_key)
+    .map((s) => ({ slot: Number(s.slot), menu_key: s.menu_key }));
+  const data = await AdminAPI.post('/api/admin/favorites', { slots: payload });
+  window.LABELUP_ADMIN_FAVS = data.data?.slots || slots;
+  renderAdminFavs(window.LABELUP_ADMIN_FAVS);
+}
+
+async function assignAdminFav(slotNo, menuKey) {
+  try {
+    const next = currentFavSlots().map((s) => ({ ...s }));
+    next.forEach((s) => {
+      if (menuKey && s.menu_key === menuKey && Number(s.slot) !== slotNo) {
+        s.menu_key = null;
+        s.label = null;
+        s.href = null;
+        s.ic = null;
+      }
+      if (Number(s.slot) === slotNo) {
+        if (!menuKey) {
+          s.menu_key = null;
+          s.label = null;
+          s.href = null;
+          s.ic = null;
+        } else {
+          const menu = (window.LABELUP_ADMIN_MENUS || []).find((m) => m.key === menuKey);
+          s.menu_key = menuKey;
+          s.label = menu?.label || menuKey;
+          s.href = adminMenuHref(menu);
+          s.ic = menu?.ic || '★';
+        }
+      }
+    });
+    await persistAdminFavs(next);
+    closeAdminFavModal();
+    showAdminAlert('즐겨찾기를 저장했습니다.', 'success');
+  } catch (err) {
+    showAdminAlert(err.message, 'error');
+  }
+}
+
+function initAdminFavorites() {
+  const root = document.getElementById('adminFavs');
+  if (!root) return;
+  const editBtn = root.querySelector('.js-fav-edit');
+  editBtn?.addEventListener('click', () => {
+    root.classList.toggle('is-editing');
+    editBtn.textContent = root.classList.contains('is-editing') ? '완료' : '편집';
+  });
+  root.addEventListener('click', (e) => {
+    const clear = e.target.closest('.js-fav-clear');
+    if (clear) {
+      e.preventDefault();
+      e.stopPropagation();
+      assignAdminFav(Number(clear.dataset.slot), '');
+      return;
+    }
+    const pick = e.target.closest('.js-fav-pick');
+    if (pick) {
+      openAdminFavModal(Number(pick.dataset.slot));
+      return;
+    }
+    const filled = e.target.closest('.admin-fav-slot.is-filled');
+    if (filled && root.classList.contains('is-editing')) {
+      e.preventDefault();
+      openAdminFavModal(Number(filled.dataset.slot));
+    }
+  });
+  document.querySelectorAll('[data-close="adminFavModal"]').forEach((el) => {
+    el.addEventListener('click', closeAdminFavModal);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeAdminFavModal();
+  });
+}
+
+function fullscreenElement() {
+  return document.fullscreenElement || document.webkitFullscreenElement || null;
+}
+
+async function enterAdminFullscreen() {
+  const el = document.documentElement;
+  if (el.requestFullscreen) await el.requestFullscreen();
+  else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+}
+
+async function exitAdminFullscreen() {
+  if (document.exitFullscreen) await document.exitFullscreen();
+  else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+}
+
+function syncAdminFullscreenUi() {
+  const on = !!fullscreenElement();
+  document.body.classList.toggle('is-admin-fullscreen', on);
+  const btn = document.getElementById('adminFullscreenBtn');
+  if (btn) {
+    btn.classList.toggle('is-on', on);
+    btn.title = on ? '전체화면 종료' : '전체화면';
+    btn.setAttribute('aria-label', btn.title);
+  }
+}
+
+function initAdminFullscreen() {
+  const btn = document.getElementById('adminFullscreenBtn');
+  if (!btn) return;
+  btn.addEventListener('click', async () => {
+    try {
+      if (fullscreenElement()) {
+        await exitAdminFullscreen();
+        localStorage.setItem(ADMIN_FS_KEY, '0');
+      } else {
+        await enterAdminFullscreen();
+        localStorage.setItem(ADMIN_FS_KEY, '1');
+      }
+    } catch (err) {
+      showAdminAlert('브라우저에서 전체화면을 허용해 주세요.', 'error');
+    }
+  });
+  document.addEventListener('fullscreenchange', () => {
+    const on = !!fullscreenElement();
+    localStorage.setItem(ADMIN_FS_KEY, on ? '1' : '0');
+    syncAdminFullscreenUi();
+  });
+  document.addEventListener('webkitfullscreenchange', syncAdminFullscreenUi);
+  syncAdminFullscreenUi();
+}
+
+function formatAdminMoney(n) {
+  return Number(n || 0).toLocaleString('ko-KR') + '원';
+}
+
+function renderAdminAlerts(snap) {
+  const badge = document.getElementById('adminBellBadge');
+  const list = document.getElementById('adminBellList');
+  if (!badge || !list) return;
+  const total = Number(snap?.unread_total || 0);
+  badge.hidden = total <= 0;
+  badge.textContent = total > 99 ? '99+' : String(total);
+  const items = [];
+  (snap?.orders?.latest || []).forEach((row) => {
+    items.push({
+      href: window.LABELUP_ADMIN_ORDERS_URL || '/admin/shop/orders',
+      title: `새 주문 ${row.order_no || ''}`.trim(),
+      meta: `${row.customer_name || ''} · ${formatAdminMoney(row.total_amount)}`,
+    });
+  });
+  (snap?.inquiries?.latest || []).forEach((row) => {
+    items.push({
+      href: window.LABELUP_ADMIN_INQUIRIES_URL || '/admin/ops/inquiries',
+      title: `새 문의 ${row.subject || ''}`.trim(),
+      meta: `${row.name || ''} · ${String(row.created_at || '').slice(0, 16)}`,
+    });
+  });
+  if (!items.length) {
+    list.innerHTML = '<p class="admin-bell-empty">새 주문·문의가 없습니다.</p>';
+    return;
+  }
+  list.innerHTML = '';
+  items.forEach((item) => {
+    const a = document.createElement('a');
+    a.className = 'admin-bell-item';
+    a.href = item.href;
+    const b = document.createElement('b');
+    b.textContent = item.title;
+    const span = document.createElement('span');
+    span.textContent = item.meta;
+    a.append(b, span);
+    list.appendChild(a);
+  });
+}
+
+async function ackAdminAlerts(snap) {
+  return AdminAPI.post('/api/admin/alerts/ack', {
+    last_seen_order_id: Number(snap?.orders?.latest_id || 0),
+    last_seen_inquiry_id: Number(snap?.inquiries?.latest_id || 0),
+  });
+}
+
+function notifyAdminDesktop(snap, prevTotal) {
+  const total = Number(snap?.unread_total || 0);
+  if (total <= prevTotal || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  const orderN = Number(snap?.orders?.unread || 0);
+  const inqN = Number(snap?.inquiries?.unread || 0);
+  const parts = [];
+  if (orderN) parts.push(`주문 ${orderN}건`);
+  if (inqN) parts.push(`문의 ${inqN}건`);
+  try {
+    new Notification('LabelUp 관리자', { body: `새 ${parts.join(', ') || '알림'}이 있습니다.`, silent: true });
+  } catch (e) { /* ignore */ }
+}
+
+function initAdminAlerts() {
+  const wrap = document.getElementById('adminBellWrap');
+  const btn = document.getElementById('adminBellBtn');
+  const panel = document.getElementById('adminBellPanel');
+  const ackBtn = document.getElementById('adminBellAck');
+  if (!wrap || !btn || !panel) return;
+  let lastSnap = null;
+  let prevTotal = 0;
+
+  const refresh = async (silent) => {
+    try {
+      const data = await AdminAPI.get('/api/admin/alerts');
+      const snap = data.data || {};
+      renderAdminAlerts(snap);
+      if (!silent) notifyAdminDesktop(snap, prevTotal);
+      prevTotal = Number(snap.unread_total || 0);
+      lastSnap = snap;
+    } catch (e) { /* 세션 만료 등은 무시 */ }
+  };
+
+  btn.addEventListener('click', async () => {
+    const willOpen = panel.hidden;
+    panel.hidden = !willOpen;
+    const profile = document.getElementById('adminProfileMenu');
+    if (willOpen && profile) {
+      profile.hidden = true;
+      document.getElementById('adminProfileWrap')?.classList.remove('is-open');
+      document.getElementById('adminProfileBtn')?.setAttribute('aria-expanded', 'false');
+    }
+    if (!willOpen) return;
+    if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+      Notification.requestPermission().catch(() => {});
+    }
+    await refresh(true);
+    if (lastSnap && Number(lastSnap.unread_total || 0) > 0) {
+      try {
+        await ackAdminAlerts(lastSnap);
+        const badge = document.getElementById('adminBellBadge');
+        if (badge) {
+          badge.hidden = true;
+          badge.textContent = '0';
+        }
+        prevTotal = 0;
+      } catch (e) { /* ignore */ }
+    }
+  });
+  ackBtn?.addEventListener('click', async () => {
+    if (!lastSnap) return;
+    try {
+      await ackAdminAlerts(lastSnap);
+      lastSnap = {
+        ...lastSnap,
+        unread_total: 0,
+        orders: { ...lastSnap.orders, unread: 0, latest: [] },
+        inquiries: { ...lastSnap.inquiries, unread: 0, latest: [] },
+      };
+      renderAdminAlerts(lastSnap);
+      prevTotal = 0;
+    } catch (err) {
+      showAdminAlert(err.message, 'error');
+    }
+  });
+  document.addEventListener('click', (e) => {
+    if (!wrap.contains(e.target)) panel.hidden = true;
+  });
+  refresh(true);
+  window.setInterval(() => refresh(false), ADMIN_ALERT_MS);
+}
+
+function initAdminProfileMenu() {
+  const wrap = document.getElementById('adminProfileWrap');
+  const btn = document.getElementById('adminProfileBtn');
+  const menu = document.getElementById('adminProfileMenu');
+  const pwBtn = document.getElementById('adminPasswordBtn');
+  const pwModal = document.getElementById('adminPasswordModal');
+  const pwForm = document.getElementById('adminPasswordForm');
+  if (!wrap || !btn || !menu) return;
+
+  const setOpen = (open) => {
+    menu.hidden = !open;
+    wrap.classList.toggle('is-open', open);
+    btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+    if (open) {
+      const bell = document.getElementById('adminBellPanel');
+      if (bell) bell.hidden = true;
+    }
+  };
+
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setOpen(menu.hidden);
+  });
+  document.addEventListener('click', (e) => {
+    if (!wrap.contains(e.target)) setOpen(false);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') setOpen(false);
+  });
+
+  const openPwModal = () => {
+    setOpen(false);
+    if (pwModal) pwModal.hidden = false;
+    pwForm?.querySelector('[name=current_password]')?.focus();
+  };
+  const closePwModal = () => {
+    if (pwModal) pwModal.hidden = true;
+    pwForm?.reset();
+  };
+  pwBtn?.addEventListener('click', openPwModal);
+  pwModal?.querySelectorAll('[data-close="adminPasswordModal"]').forEach((el) => {
+    el.addEventListener('click', closePwModal);
+  });
+  pwForm?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(pwForm);
+    const next = String(fd.get('new_password') || '');
+    const confirm = String(fd.get('new_password_confirm') || '');
+    if (next !== confirm) {
+      showAdminAlert('새 비밀번호가 일치하지 않습니다.', 'error');
+      return;
+    }
+    const submit = pwForm.querySelector('[type=submit]');
+    if (submit) submit.disabled = true;
+    try {
+      await AdminAPI.post('/api/admin/password', {
+        current_password: fd.get('current_password'),
+        new_password: next,
+        new_password_confirm: confirm,
+      });
+      closePwModal();
+      showAdminAlert('비밀번호가 변경되었습니다.');
+    } catch (err) {
+      showAdminAlert(err.message, 'error');
+    } finally {
+      if (submit) submit.disabled = false;
+    }
+  });
+}
+
+initAdminFavorites();
+initAdminFullscreen();
+initAdminAlerts();
+initAdminProfileMenu();
+
+function initAdminStaffPage() {
+  const form = document.getElementById('adminStaffForm');
+  const modal = document.getElementById('adminStaffModal');
+  if (!form || !modal) return;
+
+  const title = document.getElementById('adminStaffTitle');
+  const lookupBtn = document.getElementById('adminStaffLookup');
+  const modeWrap = document.getElementById('adminStaffModeWrap');
+  const pwHint = document.getElementById('adminStaffPwHint');
+  const superBox = document.getElementById('adminStaffSuper');
+  const perms = document.getElementById('adminStaffPerms');
+  const emailInput = form.querySelector('[name=email]');
+  const idInput = form.querySelector('[name=id]');
+  const pwInput = form.querySelector('[name=password]');
+
+  const close = () => { modal.hidden = true; };
+  const boxes = () => [...form.querySelectorAll('input[name="menu_keys[]"]')];
+  const setPermsDisabled = (off) => {
+    if (perms) perms.style.opacity = off ? '0.45' : '1';
+    boxes().forEach((el) => { el.disabled = off; });
+  };
+  const fillPerms = (keys) => {
+    const set = new Set(keys || []);
+    boxes().forEach((el) => { el.checked = set.has(el.value); });
+  };
+
+  const openCreate = () => {
+    form.reset();
+    idInput.value = '';
+    emailInput.readOnly = false;
+    if (modeWrap) modeWrap.hidden = true;
+    if (lookupBtn) lookupBtn.hidden = true;
+    if (pwHint) pwHint.textContent = '신규 등록 시 필수입니다.';
+    if (title) title.textContent = '관리자 등록';
+    fillPerms([]);
+    setPermsDisabled(false);
+    modal.hidden = false;
+  };
+
+  const openEdit = (row) => {
+    form.reset();
+    idInput.value = String(row.id || '');
+    form.querySelector('[name=name]').value = row.name || '';
+    emailInput.value = row.email || '';
+    emailInput.readOnly = true;
+    form.querySelector('[name=status]').value = row.status || 'active';
+    if (superBox) superBox.checked = !!Number(row.is_super_admin);
+    if (modeWrap) modeWrap.hidden = true;
+    if (lookupBtn) lookupBtn.hidden = true;
+    if (pwHint) pwHint.textContent = '변경할 때만 입력하세요.';
+    if (title) title.textContent = '관리자 권한 설정';
+    fillPerms(row.menu_keys || []);
+    setPermsDisabled(superBox ? superBox.checked : false);
+    modal.hidden = false;
+  };
+
+  document.getElementById('adminStaffCreate')?.addEventListener('click', openCreate);
+  document.querySelectorAll('[data-close="adminStaffModal"]').forEach((el) => {
+    el.addEventListener('click', close);
+  });
+  document.querySelectorAll('.js-staff-edit').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      try { openEdit(JSON.parse(btn.dataset.admin || '{}')); } catch (e) { showAdminAlert('데이터를 읽지 못했습니다.', 'error'); }
+    });
+  });
+  document.querySelectorAll('.js-staff-revoke').forEach((btn) => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('이 계정의 관리자 권한을 해제할까요?')) return;
+      try {
+        await AdminAPI.post('/api/admin/admins/revoke', { id: Number(btn.dataset.id) });
+        location.reload();
+      } catch (err) {
+        showAdminAlert(err.message, 'error');
+      }
+    });
+  });
+  form.querySelectorAll('input[name=mode]').forEach((radio) => {
+    radio.addEventListener('change', () => {
+      const existing = form.querySelector('input[name=mode]:checked')?.value === 'existing';
+      if (lookupBtn) lookupBtn.hidden = !existing;
+      if (pwHint) pwHint.textContent = existing ? '기존 회원은 비밀번호를 비워두면 유지됩니다.' : '신규 등록 시 필수입니다.';
+      emailInput.readOnly = false;
+    });
+  });
+  lookupBtn?.addEventListener('click', async () => {
+    try {
+      const email = encodeURIComponent(emailInput.value || '');
+      const data = await AdminAPI.get('/api/admin/admins/lookup?email=' + email);
+      const row = data.data || {};
+      if (row.is_admin) {
+        showAdminAlert('이미 관리자로 등록된 계정입니다.', 'error');
+        return;
+      }
+      form.querySelector('[name=name]').value = row.name || '';
+      emailInput.value = row.email || '';
+      showAdminAlert('회원을 찾았습니다. 권한을 지정한 뒤 저장하세요.', 'success');
+    } catch (err) {
+      showAdminAlert(err.message, 'error');
+    }
+  });
+  superBox?.addEventListener('change', () => setPermsDisabled(superBox.checked));
+  document.getElementById('adminStaffPermAll')?.addEventListener('click', () => {
+    const allOn = boxes().every((el) => el.checked);
+    boxes().forEach((el) => { if (!el.disabled) el.checked = !allOn; });
+  });
+  document.querySelectorAll('.js-staff-group').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const group = btn.dataset.group;
+      const items = boxes().filter((el) => el.dataset.group === group && !el.disabled);
+      const allOn = items.every((el) => el.checked);
+      items.forEach((el) => { el.checked = !allOn; });
+    });
+  });
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = form.querySelector('button[type=submit]');
+    const fd = new FormData(form);
+    btn.disabled = true;
+    try {
+      await AdminAPI.post('/api/admin/admins/save', {
+        id: Number(fd.get('id') || 0),
+        name: fd.get('name'),
+        email: fd.get('email'),
+        password: fd.get('password') || '',
+        status: fd.get('status'),
+        is_super_admin: superBox ? (superBox.checked ? 1 : 0) : 0,
+        menu_keys: boxes().filter((el) => el.checked).map((el) => el.value),
+      });
+      location.reload();
+    } catch (err) {
+      showAdminAlert(err.message, 'error');
+    } finally {
+      btn.disabled = false;
+    }
+  });
+}
+
+initAdminStaffPage();
+
+function initAdminCreditOverview() {
+  const btn = document.getElementById('adminCreditSummaryBtn');
+  const modal = document.getElementById('adminCreditOverviewModal');
+  const body = document.getElementById('adminCreditOverviewBody');
+  if (!btn || !modal || !body) return;
+
+  const fmt = (n) => Number(n || 0).toLocaleString('ko-KR');
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (ch) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  })[ch]);
+  const who = (row) => {
+    const name = String(row.name || '').trim();
+    const email = String(row.email || '').trim();
+    if (name && email) return `${esc(name)} <span class="admin-muted">(${esc(email)})</span>`;
+    return esc(name || email || `#${row.user_id || ''}`);
+  };
+
+  const paintSummary = (data) => {
+    const g = btn.querySelector('[data-credit-granted]');
+    const u = btn.querySelector('[data-credit-used]');
+    const r = btn.querySelector('[data-credit-remaining]');
+    if (g) g.textContent = fmt(data.granted);
+    if (u) u.textContent = fmt(data.used);
+    if (r) r.textContent = fmt(data.remaining);
+    const remItem = r?.closest('.admin-credit-summary__item');
+    if (remItem) remItem.classList.toggle('is-debt', Number(data.remaining) < 0);
+  };
+
+  const userTable = (rows, empty) => {
+    if (!rows || !rows.length) return `<p class="admin-credit-ov-empty">${esc(empty)}</p>`;
+    return `<table><thead><tr><th>회원</th><th class="num">잔액</th></tr></thead><tbody>${
+      rows.map((row) => {
+        const bal = Number(row.balance || 0);
+        return `<tr><td>${who(row)}</td><td class="num${bal < 0 ? ' is-minus' : ''}">${fmt(bal)} C</td></tr>`;
+      }).join('')
+    }</tbody></table>`;
+  };
+
+  const renderDetail = (data) => {
+    paintSummary(data);
+    const sources = data.by_source || [];
+    const sourceHtml = sources.length
+      ? `<table><thead><tr><th>출처</th><th class="num">지급</th><th class="num">사용</th></tr></thead><tbody>${
+        sources.map((row) => `<tr>
+          <td>${esc(row.source_label || row.source)}</td>
+          <td class="num is-plus">${fmt(row.granted)}</td>
+          <td class="num is-minus">${fmt(row.used)}</td>
+        </tr>`).join('')
+      }</tbody></table>`
+      : '<p class="admin-credit-ov-empty">거래 내역이 없습니다.</p>';
+
+    const recent = data.recent || [];
+    const recentHtml = recent.length
+      ? `<table><thead><tr><th>일시</th><th>회원</th><th>내용</th><th class="num">변동</th></tr></thead><tbody>${
+        recent.map((row) => {
+          const amt = Number(row.amount || 0);
+          return `<tr>
+            <td>${esc(String(row.created_at || '').slice(0, 16))}</td>
+            <td>${who(row)}</td>
+            <td>${esc(row.description || row.tx_type_label || '')}<br><span class="admin-muted">${esc(row.source_label || '')}</span></td>
+            <td class="num${amt < 0 ? ' is-minus' : ' is-plus'}">${amt >= 0 ? '+' : ''}${fmt(amt)}</td>
+          </tr>`;
+        }).join('')
+      }</tbody></table>`
+      : '<p class="admin-credit-ov-empty">최근 거래가 없습니다.</p>';
+
+    body.innerHTML = `
+      <div class="admin-credit-ov-kpis">
+        <div class="admin-credit-ov-kpi"><span>전체 지급</span><strong>${fmt(data.granted)} C</strong></div>
+        <div class="admin-credit-ov-kpi"><span>전체 사용</span><strong>${fmt(data.used)} C</strong></div>
+        <div class="admin-credit-ov-kpi${Number(data.remaining) < 0 ? ' is-debt' : ''}"><span>전체 잔여</span><strong>${fmt(data.remaining)} C</strong></div>
+      </div>
+      <p class="admin-credit-ov-meta">잔액 보유 회원 ${fmt(data.members_with_balance)}명
+        · 마이너스 회원 ${fmt(data.members_in_debt)}명
+        · 잔여 = 회원별 잔액 합계</p>
+      <div class="admin-credit-ov-grid">
+        <div class="admin-credit-ov-card"><h3>출처별 지급·사용</h3>${sourceHtml}</div>
+        <div class="admin-credit-ov-card"><h3>잔액 상위 회원</h3>${userTable(data.top_balances, '잔액 보유 회원이 없습니다.')}</div>
+        <div class="admin-credit-ov-card"><h3>마이너스 잔액 회원</h3>${userTable(data.top_debts, '마이너스 회원이 없습니다.')}</div>
+        <div class="admin-credit-ov-card"><h3>최근 거래</h3>${recentHtml}</div>
+      </div>`;
+  };
+
+  const open = async () => {
+    modal.hidden = false;
+    body.innerHTML = '<p class="admin-muted">불러오는 중…</p>';
+    try {
+      const base = window.LABELUP_ADMIN_CREDIT_OVERVIEW_URL || '/api/admin/credit/overview';
+      const url = base.includes('?') ? `${base}&detail=1` : `${base}?detail=1`;
+      const res = await AdminAPI.get(url);
+      renderDetail(res.data || {});
+    } catch (err) {
+      body.innerHTML = `<p class="admin-credit-ov-empty">${esc(err.message || '불러오지 못했습니다.')}</p>`;
+    }
+  };
+
+  const close = () => { modal.hidden = true; };
+  btn.addEventListener('click', open);
+  modal.querySelectorAll('[data-close="adminCreditOverviewModal"]').forEach((el) => {
+    el.addEventListener('click', close);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !modal.hidden) close();
+  });
+}
+
+initAdminCreditOverview();
+
+function initPiiReveal() {
+  const modal = document.getElementById('piiRevealModal');
+  const form = document.getElementById('piiRevealForm');
+  if (!modal || !form) return;
+
+  const hint = document.getElementById('piiRevealHint');
+  const errorEl = document.getElementById('piiRevealError');
+  const input = form.querySelector('[name=password]');
+  const submitBtn = document.querySelector('[form="piiRevealForm"][type=submit]');
+  let target = null;
+
+  const clearError = () => {
+    if (!errorEl) return;
+    errorEl.textContent = '';
+    errorEl.className = 'admin-alert';
+  };
+
+  const close = () => {
+    modal.hidden = true;
+    form.reset();
+    target = null;
+    clearError();
+  };
+
+  document.addEventListener('click', (e) => {
+    const btn = e.target.closest('.js-pii-reveal');
+    if (!btn || btn.classList.contains('is-revealed')) return;
+    target = btn;
+    const label = btn.dataset.label || '정보';
+    if (hint) hint.textContent = `가려진 ${label}을 보려면 로그인 비밀번호를 입력하세요.`;
+    clearError();
+    form.reset();
+    modal.hidden = false;
+    input?.focus();
+  });
+
+  modal.querySelectorAll('[data-close="piiRevealModal"]').forEach((el) => {
+    el.addEventListener('click', close);
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !modal.hidden) close();
+  });
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    if (!target) return;
+    clearError();
+    if (submitBtn) submitBtn.disabled = true;
+    const btn = target;
+    try {
+      const res = await AdminAPI.post('/api/admin/users/reveal', {
+        user_id: Number(btn.dataset.userId || 0),
+        field: btn.dataset.field || '',
+        password: input?.value || '',
+      });
+      const value = String(res.data?.value || '-');
+      btn.textContent = value;
+      btn.classList.add('is-revealed');
+      btn.removeAttribute('title');
+      if (btn.dataset.field === 'name' || btn.dataset.field === 'email') {
+        const row = btn.closest('[data-user-row]');
+        const attr = btn.dataset.field === 'email' ? 'userEmail' : 'userName';
+        row?.querySelectorAll(`[data-${btn.dataset.field === 'email' ? 'user-email' : 'user-name'}]`).forEach((el) => {
+          el.dataset[attr] = value === '-' ? '' : value;
+        });
+      }
+      close();
+    } catch (err) {
+      if (errorEl) {
+        errorEl.textContent = err.message || '확인할 수 없습니다.';
+        errorEl.className = 'admin-alert error show';
+      }
+      input?.focus();
+      input?.select();
+    } finally {
+      if (submitBtn) submitBtn.disabled = false;
+    }
+  });
+}
+
+initPiiReveal();

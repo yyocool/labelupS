@@ -1,0 +1,580 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Repositories;
+
+use App\Models\BaseModel;
+
+final class CreditRepository extends BaseModel
+{
+    public function getBalance(int $userId): int
+    {
+        $row = $this->fetchOne(
+            'SELECT balance FROM user_credits WHERE user_id = :user_id',
+            ['user_id' => $userId]
+        );
+        return (int) ($row['balance'] ?? 0);
+    }
+
+    public function ensureBalanceRow(int $userId): void
+    {
+        $now = date('Y-m-d H:i:s');
+        $this->execute(
+            'INSERT IGNORE INTO user_credits (user_id, balance, updated_at) VALUES (:user_id, 0, :now)',
+            ['user_id' => $userId, 'now' => $now]
+        );
+    }
+
+    public function setBalance(int $userId, int $balance): void
+    {
+        $this->ensureBalanceRow($userId);
+        $this->execute(
+            'UPDATE user_credits SET balance = :balance, updated_at = :now WHERE user_id = :user_id',
+            ['balance' => $balance, 'now' => date('Y-m-d H:i:s'), 'user_id' => $userId]
+        );
+    }
+
+    public function hasSourceRef(string $source, string $sourceRef): bool
+    {
+        if ($source === '' || $sourceRef === '') {
+            return false;
+        }
+        $row = $this->fetchOne(
+            'SELECT id FROM credit_transactions WHERE source = :source AND source_ref = :ref LIMIT 1',
+            ['source' => $source, 'ref' => $sourceRef]
+        );
+        return $row !== null;
+    }
+
+    public function findIdBySourceRef(string $source, string $sourceRef): int
+    {
+        if ($source === '' || $sourceRef === '') {
+            return 0;
+        }
+        $row = $this->fetchOne(
+            'SELECT id FROM credit_transactions WHERE source = :source AND source_ref = :ref ORDER BY id DESC LIMIT 1',
+            ['source' => $source, 'ref' => $sourceRef]
+        );
+        return (int) ($row['id'] ?? 0);
+    }
+
+    public function addTransaction(array $data): int
+    {
+        $now = date('Y-m-d H:i:s');
+        $this->execute(
+            'INSERT INTO credit_transactions (user_id, amount, balance_after, tx_type, source, source_ref, description, admin_id, created_at)
+             VALUES (:user_id, :amount, :balance_after, :tx_type, :source, :source_ref, :description, :admin_id, :created_at)',
+            [
+                'user_id' => (int) $data['user_id'],
+                'amount' => (int) $data['amount'],
+                'balance_after' => (int) $data['balance_after'],
+                'tx_type' => $data['tx_type'] ?? 'earn',
+                'source' => $data['source'] ?? 'system',
+                'source_ref' => $data['source_ref'] ?? null,
+                'description' => $data['description'] ?? '',
+                'admin_id' => $data['admin_id'] ?? null,
+                'created_at' => $now,
+            ]
+        );
+        return (int) $this->lastInsertId();
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function allRewardRules(): array
+    {
+        return $this->fetchAll(
+            'SELECT * FROM credit_reward_rules ORDER BY sort_order ASC, id ASC'
+        );
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function activeRulesByTrigger(string $trigger): array
+    {
+        return $this->fetchAll(
+            'SELECT * FROM credit_reward_rules
+             WHERE trigger_type = :trigger AND is_active = 1
+             ORDER BY sort_order ASC, id ASC',
+            ['trigger' => $trigger]
+        );
+    }
+
+    public function countUserRewardByCode(int $userId, string $code, ?string $since = null): int
+    {
+        $sql = 'SELECT COUNT(*) AS cnt FROM credit_transactions
+                WHERE user_id = :user_id AND source = :source AND source_ref LIKE :ref';
+        $params = [
+            'user_id' => $userId,
+            'source' => 'reward',
+            'ref' => $code . ':%',
+        ];
+        if ($since !== null && $since !== '') {
+            $sql .= ' AND created_at >= :since';
+            $params['since'] = $since;
+        }
+        $row = $this->fetchOne($sql, $params);
+        return (int) ($row['cnt'] ?? 0);
+    }
+
+    public function saveRewardRule(array $data): int
+    {
+        $now = date('Y-m-d H:i:s');
+        $id = (int) ($data['id'] ?? 0);
+        $params = [
+            'code' => strtoupper(trim((string) $data['code'])),
+            'name' => trim((string) $data['name']),
+            'description' => trim((string) ($data['description'] ?? '')),
+            'credit_amount' => (int) $data['credit_amount'],
+            'trigger_type' => (string) ($data['trigger_type'] ?? 'event'),
+            'daily_limit' => ($data['daily_limit'] ?? '') !== '' ? (int) $data['daily_limit'] : null,
+            'max_total_per_user' => ($data['max_total_per_user'] ?? '') !== '' ? (int) $data['max_total_per_user'] : null,
+            'is_active' => (int) !empty($data['is_active']),
+            'sort_order' => (int) ($data['sort_order'] ?? 0),
+            'now' => $now,
+        ];
+        if ($id > 0) {
+            $this->execute(
+                'UPDATE credit_reward_rules SET code=:code,name=:name,description=:description,credit_amount=:credit_amount,
+                 trigger_type=:trigger_type,daily_limit=:daily_limit,max_total_per_user=:max_total_per_user,
+                 is_active=:is_active,sort_order=:sort_order,updated_at=:now WHERE id=:id',
+                $params + ['id' => $id]
+            );
+            return $id;
+        }
+        $this->execute(
+            'INSERT INTO credit_reward_rules (code,name,description,credit_amount,trigger_type,daily_limit,max_total_per_user,is_active,sort_order,created_at,updated_at)
+             VALUES (:code,:name,:description,:credit_amount,:trigger_type,:daily_limit,:max_total_per_user,:is_active,:sort_order,:now,:now)',
+            $params
+        );
+        return (int) $this->lastInsertId();
+    }
+
+    public function deleteRewardRule(int $id): void
+    {
+        $this->execute('DELETE FROM credit_reward_rules WHERE id = :id', ['id' => $id]);
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function allPurchaseProducts(): array
+    {
+        return $this->fetchAll('SELECT * FROM purchase_credit_products ORDER BY id DESC');
+    }
+
+    public function savePurchaseProduct(array $data): int
+    {
+        $now = date('Y-m-d H:i:s');
+        $id = (int) ($data['id'] ?? 0);
+        $params = [
+            'name' => trim((string) $data['name']),
+            'sku' => trim((string) $data['sku']),
+            'credit_amount' => (int) $data['credit_amount'],
+            'description' => trim((string) ($data['description'] ?? '')),
+            'is_active' => (int) !empty($data['is_active']),
+            'now' => $now,
+        ];
+        if ($id > 0) {
+            $this->execute(
+                'UPDATE purchase_credit_products SET name=:name,sku=:sku,credit_amount=:credit_amount,description=:description,is_active=:is_active,updated_at=:now WHERE id=:id',
+                $params + ['id' => $id]
+            );
+            return $id;
+        }
+        $this->execute(
+            'INSERT INTO purchase_credit_products (name,sku,credit_amount,description,is_active,created_at,updated_at)
+             VALUES (:name,:sku,:credit_amount,:description,:is_active,:now,:now)',
+            $params
+        );
+        return (int) $this->lastInsertId();
+    }
+
+    public function deletePurchaseProduct(int $id): void
+    {
+        $this->execute('DELETE FROM purchase_credit_products WHERE id = :id', ['id' => $id]);
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function redemptionHistory(int $page = 1, int $perPage = 20, string $search = ''): array
+    {
+        $page = max(1, $page);
+        $offset = ($page - 1) * $perPage;
+        $params = [];
+        $where = 'c.is_redeemed = 1';
+        if ($search !== '') {
+            $where .= ' AND (c.code LIKE :search OR p.name LIKE :search OR p.sku LIKE :search OR u.email LIKE :search OR pr.name LIKE :search)';
+            $params['search'] = '%' . $search . '%';
+        }
+        $items = $this->fetchAll(
+            "SELECT c.*, p.name AS product_name, p.sku, p.credit_amount,
+                    u.email AS user_email, pr.name AS user_name
+             FROM purchase_credit_codes c
+             INNER JOIN purchase_credit_products p ON p.id = c.product_id
+             LEFT JOIN users u ON u.id = c.redeemed_by_user_id
+             LEFT JOIN user_profiles pr ON pr.user_id = u.id AND pr.deleted_at IS NULL
+             WHERE {$where}
+             ORDER BY c.redeemed_at DESC, c.id DESC
+             LIMIT {$perPage} OFFSET {$offset}",
+            $params
+        );
+        $total = (int) ($this->fetchOne(
+            "SELECT COUNT(*) AS cnt FROM purchase_credit_codes c
+             INNER JOIN purchase_credit_products p ON p.id = c.product_id
+             LEFT JOIN users u ON u.id = c.redeemed_by_user_id
+             LEFT JOIN user_profiles pr ON pr.user_id = u.id AND pr.deleted_at IS NULL
+             WHERE {$where}",
+            $params
+        )['cnt'] ?? 0);
+        $pages = max(1, (int) ceil($total / $perPage));
+        return ['items' => $items, 'total' => $total, 'page' => $page, 'pages' => $pages, 'per_page' => $perPage];
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function allCodes(int $productId = 0): array
+    {
+        $params = [];
+        $where = '1=1';
+        if ($productId > 0) {
+            $where .= ' AND c.product_id = :product_id';
+            $params['product_id'] = $productId;
+        }
+        return $this->fetchAll(
+            "SELECT c.*, p.name AS product_name, p.sku, p.credit_amount
+             FROM purchase_credit_codes c
+             INNER JOIN purchase_credit_products p ON p.id = c.product_id
+             WHERE {$where}
+             ORDER BY c.id DESC
+             LIMIT 500",
+            $params
+        );
+    }
+
+    public function createCodes(int $productId, array $codes, string $batchNo): int
+    {
+        $now = date('Y-m-d H:i:s');
+        $count = 0;
+        foreach ($codes as $code) {
+            $code = strtoupper(trim((string) $code));
+            if ($code === '') {
+                continue;
+            }
+            try {
+                $this->execute(
+                    'INSERT INTO purchase_credit_codes (product_id, code, batch_no, created_at) VALUES (:product_id, :code, :batch_no, :now)',
+                    ['product_id' => $productId, 'code' => $code, 'batch_no' => $batchNo, 'now' => $now]
+                );
+                $count++;
+            } catch (\Throwable) {
+                // skip duplicate
+            }
+        }
+        return $count;
+    }
+
+    /** @return array{items: array, total: int, page: int, pages: int} */
+    public function transactionsForUser(int $userId, int $page = 1, int $perPage = 20): array
+    {
+        $page = max(1, $page);
+        $offset = ($page - 1) * $perPage;
+        $items = $this->fetchAll(
+            "SELECT * FROM credit_transactions WHERE user_id = :user_id ORDER BY id DESC LIMIT {$perPage} OFFSET {$offset}",
+            ['user_id' => $userId]
+        );
+        $total = (int) ($this->fetchOne(
+            'SELECT COUNT(*) AS cnt FROM credit_transactions WHERE user_id = :user_id',
+            ['user_id' => $userId]
+        )['cnt'] ?? 0);
+        return ['items' => $items, 'total' => $total, 'page' => $page, 'pages' => max(1, (int) ceil($total / $perPage)), 'per_page' => $perPage];
+    }
+
+    public function sumSpendBySourceSince(int $userId, string $source, string $since): int
+    {
+        $row = $this->fetchOne(
+            "SELECT COALESCE(SUM(CASE
+                    WHEN tx_type = 'spend' AND amount < 0 THEN -amount
+                    WHEN tx_type = 'refund' AND amount > 0 THEN -amount
+                    ELSE 0
+                END), 0) AS spent
+             FROM credit_transactions
+             WHERE user_id = :user_id
+               AND source = :source
+               AND tx_type IN ('spend', 'refund')
+               AND created_at >= :since",
+            [
+                'user_id' => $userId,
+                'source' => $source,
+                'since' => $since,
+            ]
+        );
+        return max(0, (int) ($row['spent'] ?? 0));
+    }
+
+    /**
+     * 전체 회원 잉크 요약.
+     * @return array{granted:int,used:int,remaining:int,members_with_balance:int,members_in_debt:int}
+     */
+    public function globalTotals(): array
+    {
+        $tx = $this->fetchOne(
+            "SELECT
+                COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS granted,
+                COALESCE(SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END), 0) AS used
+             FROM credit_transactions"
+        );
+        $bal = $this->fetchOne(
+            "SELECT
+                COALESCE(SUM(balance), 0) AS remaining,
+                COALESCE(SUM(CASE WHEN balance > 0 THEN 1 ELSE 0 END), 0) AS with_balance,
+                COALESCE(SUM(CASE WHEN balance < 0 THEN 1 ELSE 0 END), 0) AS in_debt
+             FROM user_credits"
+        );
+        return [
+            'granted' => (int) ($tx['granted'] ?? 0),
+            'used' => (int) ($tx['used'] ?? 0),
+            'remaining' => (int) ($bal['remaining'] ?? 0),
+            'members_with_balance' => (int) ($bal['with_balance'] ?? 0),
+            'members_in_debt' => (int) ($bal['in_debt'] ?? 0),
+        ];
+    }
+
+    /**
+     * @return array<int, array{source:string,granted:int,used:int}>
+     */
+    public function totalsBySource(): array
+    {
+        $rows = $this->fetchAll(
+            "SELECT source,
+                    COALESCE(SUM(CASE WHEN amount > 0 THEN amount ELSE 0 END), 0) AS granted,
+                    COALESCE(SUM(CASE WHEN amount < 0 THEN ABS(amount) ELSE 0 END), 0) AS used
+             FROM credit_transactions
+             GROUP BY source
+             ORDER BY COALESCE(SUM(ABS(amount)), 0) DESC"
+        );
+        $out = [];
+        foreach ($rows as $row) {
+            $out[] = [
+                'source' => (string) ($row['source'] ?? 'system'),
+                'granted' => (int) ($row['granted'] ?? 0),
+                'used' => (int) ($row['used'] ?? 0),
+            ];
+        }
+        return $out;
+    }
+
+    /**
+     * @return array<int, array{user_id:int,email:string,name:string,balance:int}>
+     */
+    public function topBalances(int $limit = 10, bool $debt = false): array
+    {
+        $limit = max(1, min(50, $limit));
+        $order = $debt ? 'c.balance ASC' : 'c.balance DESC';
+        $where = $debt ? 'c.balance < 0' : 'c.balance > 0';
+        return $this->fetchAll(
+            "SELECT c.user_id, c.balance, u.email, COALESCE(p.name, '') AS name
+             FROM user_credits c
+             INNER JOIN users u ON u.id = c.user_id AND u.deleted_at IS NULL
+             LEFT JOIN user_profiles p ON p.user_id = u.id AND p.deleted_at IS NULL
+             WHERE {$where}
+             ORDER BY {$order}
+             LIMIT {$limit}"
+        );
+    }
+
+    /**
+     * @return array<int, array<string, mixed>>
+     */
+    public function recentTransactions(int $limit = 15): array
+    {
+        $limit = max(1, min(50, $limit));
+        return $this->fetchAll(
+            "SELECT t.id, t.user_id, t.amount, t.balance_after, t.tx_type, t.source, t.description, t.created_at,
+                    u.email, COALESCE(p.name, '') AS name
+             FROM credit_transactions t
+             INNER JOIN users u ON u.id = t.user_id
+             LEFT JOIN user_profiles p ON p.user_id = u.id AND p.deleted_at IS NULL
+             ORDER BY t.id DESC
+             LIMIT {$limit}"
+        );
+    }
+
+    /**
+     * @param array{q?:string,source?:string,date_from?:string,date_to?:string} $filters
+     * @return array{grant_count:int,grant_amount:int,admin_count:int,admin_amount:int,reward_count:int,reward_amount:int,user_count:int}
+     */
+    public function adminGrantStats(?int $userId = null, array $filters = []): array
+    {
+        [$where, $params, $from] = $this->adminGrantScope($userId, $filters);
+        $row = $this->fetchOne(
+            "SELECT COUNT(*) AS grant_count,
+                    COALESCE(SUM(t.amount), 0) AS grant_amount,
+                    COALESCE(SUM(CASE WHEN t.source = 'admin' THEN 1 ELSE 0 END), 0) AS admin_count,
+                    COALESCE(SUM(CASE WHEN t.source = 'admin' THEN t.amount ELSE 0 END), 0) AS admin_amount,
+                    COALESCE(SUM(CASE WHEN t.source = 'reward' THEN 1 ELSE 0 END), 0) AS reward_count,
+                    COALESCE(SUM(CASE WHEN t.source = 'reward' THEN t.amount ELSE 0 END), 0) AS reward_amount,
+                    COUNT(DISTINCT t.user_id) AS user_count
+             {$from}
+             WHERE {$where}",
+            $params
+        ) ?? [];
+
+        return [
+            'grant_count' => (int) ($row['grant_count'] ?? 0),
+            'grant_amount' => (int) ($row['grant_amount'] ?? 0),
+            'admin_count' => (int) ($row['admin_count'] ?? 0),
+            'admin_amount' => (int) ($row['admin_amount'] ?? 0),
+            'reward_count' => (int) ($row['reward_count'] ?? 0),
+            'reward_amount' => (int) ($row['reward_amount'] ?? 0),
+            'user_count' => (int) ($row['user_count'] ?? 0),
+        ];
+    }
+
+    /**
+     * @param array{q?:string,source?:string,date_from?:string,date_to?:string} $filters
+     * @return array{items: array, total: int, page: int, pages: int, per_page: int}
+     */
+    public function adminGrants(?int $userId = null, int $page = 1, int $perPage = 20, array $filters = []): array
+    {
+        $page = max(1, $page);
+        $perPage = max(1, min(100, $perPage));
+        $offset = ($page - 1) * $perPage;
+        [$where, $params, $from] = $this->adminGrantScope($userId, $filters);
+        $items = $this->fetchAll(
+            "SELECT t.id, t.user_id, t.amount, t.balance_after, t.tx_type, t.source, t.description, t.admin_id, t.created_at,
+                    u.email AS user_email, p.name AS user_name, p.phone AS user_phone,
+                    a.email AS admin_email, ap.name AS admin_name
+             {$from}
+             WHERE {$where}
+             ORDER BY t.id DESC
+             LIMIT {$perPage} OFFSET {$offset}",
+            $params
+        );
+        $total = (int) ($this->fetchOne(
+            "SELECT COUNT(*) AS cnt {$from} WHERE {$where}",
+            $params
+        )['cnt'] ?? 0);
+        return [
+            'items' => $items,
+            'total' => $total,
+            'page' => $page,
+            'pages' => max(1, (int) ceil($total / $perPage)),
+            'per_page' => $perPage,
+        ];
+    }
+
+    /**
+     * @param array{q?:string,source?:string,date_from?:string,date_to?:string} $filters
+     * @return array{0:string,1:array<string,mixed>,2:string}
+     */
+    private function adminGrantScope(?int $userId, array $filters): array
+    {
+        $where = 't.amount > 0 AND t.tx_type = \'earn\' AND t.source IN (\'admin\', \'reward\', \'qr_coupon\')';
+        $params = [];
+        if ($userId !== null && $userId > 0) {
+            $where .= ' AND t.user_id = :user_id';
+            $params['user_id'] = $userId;
+        }
+        $source = (string) ($filters['source'] ?? '');
+        if (in_array($source, ['admin', 'reward', 'qr_coupon'], true)) {
+            $where .= ' AND t.source = :source';
+            $params['source'] = $source;
+        }
+        $dateFrom = (string) ($filters['date_from'] ?? '');
+        if ($dateFrom !== '') {
+            $where .= ' AND t.created_at >= :date_from';
+            $params['date_from'] = $dateFrom . ' 00:00:00';
+        }
+        $dateTo = (string) ($filters['date_to'] ?? '');
+        if ($dateTo !== '') {
+            $where .= ' AND t.created_at <= :date_to';
+            $params['date_to'] = $dateTo . ' 23:59:59';
+        }
+        $keyword = trim((string) ($filters['q'] ?? ''));
+        if ($keyword !== '') {
+            $where .= " AND (u.email LIKE :q ESCAPE '\\\\' OR p.name LIKE :q ESCAPE '\\\\' OR p.phone LIKE :q ESCAPE '\\\\' OR t.description LIKE :q ESCAPE '\\\\' OR a.email LIKE :q ESCAPE '\\\\' OR ap.name LIKE :q ESCAPE '\\\\'";
+            $params['q'] = '%' . addcslashes($keyword, '%_\\') . '%';
+            $phoneDigits = preg_replace('/\D+/', '', $keyword) ?? '';
+            if ($phoneDigits !== '') {
+                $where .= " OR REPLACE(REPLACE(REPLACE(REPLACE(IFNULL(p.phone, ''), '-', ''), ' ', ''), '.', ''), '+', '') LIKE :q_phone ESCAPE '\\\\'";
+                $params['q_phone'] = '%' . addcslashes($phoneDigits, '%_\\') . '%';
+            }
+            $where .= ')';
+        }
+        $from = 'FROM credit_transactions t
+             INNER JOIN users u ON u.id = t.user_id
+             LEFT JOIN user_profiles p ON p.user_id = u.id AND p.deleted_at IS NULL
+             LEFT JOIN users a ON a.id = t.admin_id
+             LEFT JOIN user_profiles ap ON ap.user_id = a.id AND ap.deleted_at IS NULL';
+
+        return [$where, $params, $from];
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function csLogsForUser(int $userId): array
+    {
+        return $this->fetchAll(
+            'SELECT cs.*, a.email AS admin_email
+             FROM user_cs_logs cs
+             LEFT JOIN users a ON a.id = cs.admin_id
+             WHERE cs.user_id = :user_id
+             ORDER BY cs.id DESC',
+            ['user_id' => $userId]
+        );
+    }
+
+    public function saveCsLog(array $data): int
+    {
+        $now = date('Y-m-d H:i:s');
+        $id = (int) ($data['id'] ?? 0);
+        $params = [
+            'user_id' => (int) $data['user_id'],
+            'admin_id' => $data['admin_id'] ?? null,
+            'category' => (string) ($data['category'] ?? 'inquiry'),
+            'subject' => trim((string) $data['subject']),
+            'content' => trim((string) ($data['content'] ?? '')),
+            'status' => (string) ($data['status'] ?? 'open'),
+            'now' => $now,
+        ];
+        if ($id > 0) {
+            $this->execute(
+                'UPDATE user_cs_logs SET category=:category,subject=:subject,content=:content,status=:status,updated_at=:now WHERE id=:id',
+                $params + ['id' => $id]
+            );
+            return $id;
+        }
+        $this->execute(
+            'INSERT INTO user_cs_logs (user_id,admin_id,category,subject,content,status,created_at,updated_at)
+             VALUES (:user_id,:admin_id,:category,:subject,:content,:status,:now,:now)',
+            $params
+        );
+        return (int) $this->lastInsertId();
+    }
+
+    public function listUsersWithCredit(string $search = '', int $page = 1, int $perPage = 20): array
+    {
+        $offset = max(0, ($page - 1) * $perPage);
+        $params = [];
+        $where = 'u.deleted_at IS NULL';
+        if ($search !== '') {
+            $where .= ' AND (u.email LIKE :search OR p.name LIKE :search OR p.company LIKE :search)';
+            $params['search'] = '%' . $search . '%';
+        }
+        $items = $this->fetchAll(
+            "SELECT u.id, u.email, u.role, u.status, u.grade_id, u.created_at, u.last_login_at,
+                    p.name, p.phone, p.company, COALESCE(c.balance, 0) AS credit_balance,
+                    g.name AS grade_name, g.color AS grade_color
+             FROM users u
+             LEFT JOIN user_profiles p ON p.user_id = u.id AND p.deleted_at IS NULL
+             LEFT JOIN user_credits c ON c.user_id = u.id
+             LEFT JOIN member_grades g ON g.id = u.grade_id
+             WHERE {$where}
+             ORDER BY u.id DESC
+             LIMIT {$perPage} OFFSET {$offset}",
+            $params
+        );
+        $total = (int) ($this->fetchOne(
+            "SELECT COUNT(*) AS cnt FROM users u
+             LEFT JOIN user_profiles p ON p.user_id = u.id AND p.deleted_at IS NULL
+             WHERE {$where}",
+            $params
+        )['cnt'] ?? 0);
+        return ['items' => $items, 'total' => $total, 'page' => $page, 'pages' => max(1, (int) ceil($total / $perPage)), 'per_page' => $perPage];
+    }
+}

@@ -1,0 +1,80 @@
+<?php
+/** @var string $activeNav */
+$activeNav = $activeNav ?? '';
+$path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
+$path = rtrim((string) $path, '/') ?: '/';
+$isHomeActive = $activeNav === 'home' || $path === '/' || $path === '';
+$isDesignActive = str_starts_with($path, '/editor');
+$isShopBuyActive = $activeNav === 'shop' && !str_contains($path, '/cart');
+$isCartActive = str_contains($path, '/shop/cart');
+$isAccountActive = $activeNav === 'account' && $path === '/account';
+$isOrdersActive = str_starts_with($path, '/account/orders');
+$isFaqActive = $activeNav === 'faq';
+$isProjectsActive = $path === '/projects';
+$isLockerActive = $path === '/locker';
+$isTrashActive = $path === '/trash';
+$sidebarLoggedIn = !empty($authUser);
+$navIcons = require view_path('home/partials/menu-icons.php');
+$navIcon = static fn (string $key): string => '<span class="ico ico--svg" aria-hidden="true"><svg viewBox="0 0 24 24" width="20" height="20">' . $navIcons[$key] . '</svg></span>';
+$loginFor = static function (string $dest): string {
+    return url('login') . '?redirect=' . rawurlencode(url($dest));
+};
+?>
+<aside class="sidebar">
+  <div class="brand">
+    <a href="<?= url('/') ?>" aria-label="labelup 홈">
+      <img class="brand-img" src="<?= asset('logo.png') ?>" alt="labelup">
+    </a>
+    <small>라벨업 · AI 라벨 디자인</small>
+  </div>
+  <a class="create" href="<?= url('editor/?new=1') ?>">✎ &nbsp;새 디자인 만들기</a>
+
+  <div class="group">
+    <nav class="menu">
+      <a class="<?= $isHomeActive ? 'is-active' : '' ?>" href="<?= url('/') ?>"><?= $navIcon('home') ?>홈</a>
+      <a class="<?= $isDesignActive ? 'is-active' : '' ?>" href="<?= url('editor/') ?>"><?= $navIcon('design') ?>라벨디자인</a>
+    </nav>
+  </div>
+
+  <div class="group">
+    <div class="group-title">쇼핑 &amp; 주문</div>
+    <nav class="menu">
+      <a class="<?= $isShopBuyActive ? 'is-active' : '' ?>" href="<?= url('shop') ?>"><?= $navIcon('shop') ?>라벨 구매</a>
+      <a class="<?= $isCartActive ? 'is-active' : '' ?>" href="<?= url('shop/cart') ?>"><?= $navIcon('cart') ?>장바구니</a>
+      <a class="<?= $isOrdersActive ? 'is-active' : '' ?>" href="<?= url('account/orders') ?>"><?= $navIcon('orders') ?>주문내역</a>
+    </nav>
+  </div>
+
+  <div class="group">
+    <div class="group-title">마이라벨업</div>
+    <nav class="menu">
+      <a class="<?= $isAccountActive ? 'is-account-active' : '' ?>" href="<?= url('account') ?>"><?= $navIcon('mypage') ?>마이페이지</a>
+      <a class="<?= $isFaqActive ? 'is-account-active' : '' ?>" href="<?= url('faq') ?>"><?= $navIcon('faq') ?>FAQ</a>
+      <a class="<?= $isProjectsActive ? 'is-account-active' : '' ?>" href="<?= $sidebarLoggedIn ? url('projects') : e($loginFor('projects')) ?>"<?= $sidebarLoggedIn ? '' : ' title="로그인 후 이용할 수 있습니다"' ?>><?= $navIcon('project') ?>프로젝트</a>
+      <a class="<?= $isLockerActive ? 'is-account-active' : '' ?>" href="<?= $sidebarLoggedIn ? url('locker') : e($loginFor('locker')) ?>"<?= $sidebarLoggedIn ? '' : ' title="로그인 후 이용할 수 있습니다"' ?>><?= $navIcon('locker') ?>내 보관함</a>
+      <a class="<?= $isTrashActive ? 'is-account-active' : '' ?>" href="<?= $sidebarLoggedIn ? url('trash') : e($loginFor('trash')) ?>"<?= $sidebarLoggedIn ? '' : ' title="로그인 후 이용할 수 있습니다"' ?>><?= $navIcon('trash') ?>휴지통</a>
+    </nav>
+    <a class="menu-labi" href="<?= url('guide/') ?>" target="_blank" rel="noopener noreferrer">
+      <span class="menu-labi__ico" aria-hidden="true">★</span>
+      <span>라비 소개</span>
+      <span class="menu-labi__tag">GUIDE</span>
+    </a>
+  </div>
+
+  <div class="sidebar-bottom">
+    <?php $sidebarGrade = member_grade_for_user($authUser ?? null); ?>
+    <?php if ($sidebarGrade): ?>
+    <div class="premium premium--grade" style="--grade-color:<?= e((string) ($sidebarGrade['color'] ?? '#7B2D3E')) ?>">
+      <b>회원등급 <?= e((string) $sidebarGrade['name']) ?></b>
+      <p><?= e((string) ($sidebarGrade['description'] !== '' ? $sidebarGrade['description'] : '현재 적용 중인 회원등급입니다.')) ?></p>
+      <a href="<?= url('account') ?>">마이페이지에서 보기 →</a>
+    </div>
+    <?php else: ?>
+    <div class="premium">
+      <b>👑 프리미엄 이용권</b>
+      <p>더 많은 기능과 혜택을<br>경험해보세요!</p>
+      <a href="<?= url('login') ?>">로그인하고 확인 →</a>
+    </div>
+    <?php endif; ?>
+  </div>
+</aside>

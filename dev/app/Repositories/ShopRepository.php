@@ -1,0 +1,2177 @@
+<?php
+
+
+
+declare(strict_types=1);
+
+
+
+namespace App\Repositories;
+
+use App\Helpers\ShopCompatHelper;
+use App\Models\BaseModel;
+use App\Services\ShopProductImageService;
+
+
+
+final class ShopRepository extends BaseModel
+
+{
+    /** 일괄 임포트로 들어온 상품임을 meta_json 에 남기는 키. */
+    public const IMPORT_BATCH_META_KEY = 'import_batch';
+
+    /** product_id 로 상품에 딸려 있는 테이블. 상품을 지울 때 함께 비운다. */
+    private const PRODUCT_CHILD_TABLES = [
+        'shop_product_options',
+        'shop_product_images',
+        'shop_product_detail_pages',
+        'shop_product_wishlists',
+    ];
+
+    public function dashboardStats(): array
+
+    {
+
+        $products = $this->fetchOne('SELECT COUNT(*) AS cnt FROM shop_products WHERE status = :s', ['s' => 'active']);
+
+        $ordersToday = $this->fetchOne(
+
+            'SELECT COUNT(*) AS cnt, COALESCE(SUM(total_amount),0) AS revenue FROM shop_orders WHERE created_at >= :today',
+
+            ['today' => date('Y-m-d 00:00:00')]
+
+        );
+
+        $pending = $this->fetchOne(
+
+            'SELECT COUNT(*) AS cnt FROM shop_orders WHERE status IN (\'paid\',\'preparing\')'
+
+        );
+
+        $shipping = $this->fetchOne(
+
+            'SELECT COUNT(*) AS cnt FROM shop_orders WHERE status = \'shipping\''
+
+        );
+
+
+
+        return [
+
+            'active_products' => (int) ($products['cnt'] ?? 0),
+
+            'orders_today' => (int) ($ordersToday['cnt'] ?? 0),
+
+            'revenue_today' => (int) ($ordersToday['revenue'] ?? 0),
+
+            'pending_orders' => (int) ($pending['cnt'] ?? 0),
+
+            'shipping_orders' => (int) ($shipping['cnt'] ?? 0),
+
+        ];
+
+    }
+
+
+
+    /** @return array<int, array<string, mixed>> */
+    public function allCategories(): array
+    {
+        return $this->asCategoryTree(
+            $this->fetchAll('SELECT * FROM shop_categories ORDER BY sort_order ASC, id ASC')
+        );
+    }
+
+    public function findCategoryById(int $id): ?array
+    {
+        if ($id <= 0) {
+            return null;
+        }
+        $row = $this->fetchOne('SELECT * FROM shop_categories WHERE id = :id LIMIT 1', ['id' => $id]);
+        if ($row) {
+            $row['name'] = shop_category_display_name((string) ($row['name'] ?? ''), (string) ($row['slug'] ?? ''));
+        }
+        return $row;
+    }
+
+    public function countCategoryChildren(int $id): int
+    {
+        $row = $this->fetchOne(
+            'SELECT COUNT(*) AS cnt FROM shop_categories WHERE parent_id = :id',
+            ['id' => $id]
+        );
+        return (int) ($row['cnt'] ?? 0);
+    }
+
+    public function countProductsInCategory(int $id): int
+    {
+        $row = $this->fetchOne(
+            'SELECT COUNT(*) AS cnt FROM shop_products WHERE category_id = :id',
+            ['id' => $id]
+        );
+        return (int) ($row['cnt'] ?? 0);
+    }
+
+    public function saveCategory(array $data): int
+    {
+        $now = date('Y-m-d H:i:s');
+        $id = (int) ($data['id'] ?? 0);
+        $parentId = (int) ($data['parent_id'] ?? 0);
+        $params = [
+            'name' => $data['name'],
+            'slug' => $data['slug'],
+            'image_path' => $data['image_path'] ?? null,
+            'sort_order' => (int) $data['sort_order'],
+            'is_active' => (int) !empty($data['is_active']),
+            'parent_id' => $parentId > 0 ? $parentId : null,
+        ];
+
+        if ($id > 0) {
+            $params['now'] = $now;
+            $params['id'] = $id;
+            $this->execute(
+                'UPDATE shop_categories SET parent_id=:parent_id, name=:name, slug=:slug, image_path=:image_path, sort_order=:sort_order, is_active=:is_active, updated_at=:now WHERE id=:id',
+                $params
+            );
+            return $id;
+        }
+
+        $params['created_at'] = $now;
+        $params['updated_at'] = $now;
+        $this->execute(
+            'INSERT INTO shop_categories (parent_id, name, slug, image_path, sort_order, is_active, created_at, updated_at) VALUES (:parent_id,:name,:slug,:image_path,:sort_order,:is_active,:created_at,:updated_at)',
+            $params
+        );
+        return (int) $this->lastInsertId();
+    }
+
+    public function deleteCategory(int $id): void
+    {
+        $this->execute('DELETE FROM shop_categories WHERE id = :id', ['id' => $id]);
+    }
+
+    public function findCategoryBySlug(string $slug): ?array
+    {
+        $row = $this->fetchOne('SELECT * FROM shop_categories WHERE slug = :slug LIMIT 1', ['slug' => $slug]);
+        if ($row) {
+            $row['name'] = shop_category_display_name((string) ($row['name'] ?? ''), (string) ($row['slug'] ?? ''));
+        }
+        return $row;
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $rows
+     * @return array<int, array<string, mixed>>
+     */
+    public function asCategoryTree(array $rows): array
+    {
+        $byParent = [];
+        $roots = [];
+        foreach ($rows as $row) {
+            $pid = (int) ($row['parent_id'] ?? 0);
+            $row['parent_id'] = $pid > 0 ? $pid : null;
+            if ($pid > 0) {
+                $byParent[$pid][] = $row;
+            } else {
+                $roots[] = $row;
+            }
+        }
+
+        $out = [];
+        $append = function (array $row, int $depth, ?string $parentName) use (&$out, &$byParent, &$append): void {
+            $id = (int) ($row['id'] ?? 0);
+            $name = shop_category_display_name((string) ($row['name'] ?? ''), (string) ($row['slug'] ?? ''));
+            $row['name'] = $name;
+            $row['depth'] = $depth;
+            $row['parent_name'] = $parentName;
+            $row['label'] = $depth > 0 && $parentName !== null && $parentName !== ''
+                ? $parentName . ' / ' . $name
+                : $name;
+            $out[] = $row;
+            foreach ($byParent[$id] ?? [] as $child) {
+                $append($child, $depth + 1, $name);
+            }
+            unset($byParent[$id]);
+        };
+        foreach ($roots as $root) {
+            $append($root, 0, null);
+        }
+        foreach ($byParent as $orphans) {
+            foreach ($orphans as $orphan) {
+                $append($orphan, 1, null);
+            }
+        }
+
+        return $out;
+    }
+
+    public function findProductBySku(string $sku): ?array
+    {
+        return $this->fetchOne('SELECT * FROM shop_products WHERE sku = :sku LIMIT 1', ['sku' => $sku]);
+    }
+
+    public function findSpecMatch(float $width, float $height, string $material, ?int $labels): ?array
+    {
+        if ($labels === null) {
+            return $this->fetchOne(
+                'SELECT * FROM label_specs WHERE width_mm = :w AND height_mm = :h AND material = :m AND labels_per_sheet IS NULL LIMIT 1',
+                [
+                    'w' => $width,
+                    'h' => $height,
+                    'm' => $material,
+                ]
+            );
+        }
+
+        return $this->fetchOne(
+            'SELECT * FROM label_specs WHERE width_mm = :w AND height_mm = :h AND material = :m AND labels_per_sheet = :l LIMIT 1',
+            [
+                'w' => $width,
+                'h' => $height,
+                'm' => $material,
+                'l' => $labels,
+            ]
+        );
+    }
+
+
+
+    /** @return array<int, array<string, mixed>> */
+
+    public function allSpecs(): array
+
+    {
+
+        // 규격마다 어느 상품(SKU)이 걸려 있는지 함께 읽는다. 규격값을 고치면 그 상품을 고른
+        // 사용자의 미리보기·인쇄가 같이 바뀌므로, 목록에서 영향 범위가 바로 보여야 한다.
+
+        // 걸린 상품이 없는 규격은 편집기 용지선택에 아예 나오지 않는다(editorPapers 가
+
+        // shop_products 를 기준으로 조회하기 때문). 그것도 이 칸으로 드러난다.
+
+        return $this->fetchAll(
+
+            "SELECT s.*,
+
+                    COUNT(p.id) AS product_count,
+
+                    GROUP_CONCAT(p.sku ORDER BY p.sku SEPARATOR ',') AS product_skus
+
+             FROM label_specs s
+
+             LEFT JOIN shop_products p ON p.spec_id = s.id
+
+             GROUP BY s.id
+
+             ORDER BY s.id DESC"
+
+        );
+
+    }
+
+
+
+    public function saveSpec(array $data): int
+
+    {
+
+        $now = date('Y-m-d H:i:s');
+
+        $id = (int) ($data['id'] ?? 0);
+
+        $params = [
+
+            'name' => $data['name'],
+
+            'kind' => self::normalizePaperKind($data['kind'] ?? null, (string) ($data['name'] ?? ''), (string) ($data['description'] ?? '')),
+
+            'image_path' => $data['image_path'] ?? null,
+
+            'width_mm' => $data['width_mm'],
+
+            'height_mm' => $data['height_mm'],
+
+            'material' => $data['material'] ?? '',
+
+            'shape' => $data['shape'] ?? 'rect',
+
+            'labels_per_sheet' => $data['labels_per_sheet'] !== null && $data['labels_per_sheet'] !== '' ? (int) $data['labels_per_sheet'] : null,
+
+            'description' => $data['description'] ?? '',
+
+            'is_active' => (int) !empty($data['is_active']),
+
+            'now' => $now,
+
+        ] + self::specLayoutParams($data);
+
+        if ($id > 0) {
+
+            $this->execute(
+
+                'UPDATE label_specs SET name=:name,kind=:kind,image_path=:image_path,width_mm=:width_mm,height_mm=:height_mm,'
+                . 'paper_size=:paper_size,material=:material,shape=:shape,labels_per_sheet=:labels_per_sheet,'
+                . 'top_margin_mm=:top_margin_mm,left_margin_mm=:left_margin_mm,columns_count=:columns_count,rows_count=:rows_count,'
+                . 'h_gap_mm=:h_gap_mm,v_gap_mm=:v_gap_mm,corner_radius_x_mm=:corner_radius_x_mm,corner_radius_y_mm=:corner_radius_y_mm,'
+                . 'label_color=:label_color,custom_path_svg=:custom_path_svg,'
+                . 'description=:description,is_active=:is_active,updated_at=:now WHERE id=:id',
+
+                $params + ['id' => $id]
+
+            );
+
+            return $id;
+
+        }
+
+        $insertParams = [
+            'name' => $params['name'],
+            'kind' => $params['kind'],
+            'image_path' => $data['image_path'] ?? null,
+            'width_mm' => $params['width_mm'],
+            'height_mm' => $params['height_mm'],
+            'material' => $params['material'],
+            'shape' => $params['shape'],
+            'labels_per_sheet' => $params['labels_per_sheet'],
+            'description' => $params['description'],
+            'is_active' => $params['is_active'],
+            'created_at' => $now,
+            'updated_at' => $now,
+        ] + self::specLayoutParams($data);
+
+        $this->execute(
+
+            'INSERT INTO label_specs (name,kind,image_path,width_mm,height_mm,paper_size,material,shape,labels_per_sheet,'
+            . 'top_margin_mm,left_margin_mm,columns_count,rows_count,h_gap_mm,v_gap_mm,'
+            . 'corner_radius_x_mm,corner_radius_y_mm,label_color,custom_path_svg,'
+            . 'description,is_active,created_at,updated_at) '
+            . 'VALUES (:name,:kind,:image_path,:width_mm,:height_mm,:paper_size,:material,:shape,:labels_per_sheet,'
+            . ':top_margin_mm,:left_margin_mm,:columns_count,:rows_count,:h_gap_mm,:v_gap_mm,'
+            . ':corner_radius_x_mm,:corner_radius_y_mm,:label_color,:custom_path_svg,'
+            . ':description,:is_active,:created_at,:updated_at)',
+
+            $insertParams
+
+        );
+
+        return (int) $this->lastInsertId();
+
+    }
+
+    /**
+     * 용지 배치 컬럼은 상품 일괄 임포트처럼 값을 안 넘기는 호출도 있어서 빠진 키는 NULL로 채운다.
+     *
+     * @param array<string, mixed> $data
+     * @return array<string, mixed>
+     */
+    private static function specLayoutParams(array $data): array
+    {
+        return [
+            'paper_size' => self::nullableString($data['paper_size'] ?? null, 20),
+            'top_margin_mm' => self::nullableDecimal($data['top_margin_mm'] ?? null),
+            'left_margin_mm' => self::nullableDecimal($data['left_margin_mm'] ?? null),
+            'columns_count' => self::nullableCount($data['columns_count'] ?? null),
+            'rows_count' => self::nullableCount($data['rows_count'] ?? null),
+            'h_gap_mm' => self::nullableDecimal($data['h_gap_mm'] ?? null),
+            'v_gap_mm' => self::nullableDecimal($data['v_gap_mm'] ?? null),
+            'corner_radius_x_mm' => self::nullableDecimal($data['corner_radius_x_mm'] ?? null),
+            'corner_radius_y_mm' => self::nullableDecimal($data['corner_radius_y_mm'] ?? null),
+            'label_color' => self::nullableString($data['label_color'] ?? null, 7),
+            'custom_path_svg' => self::nullableString($data['custom_path_svg'] ?? null),
+        ];
+    }
+
+    private static function nullableString(mixed $value, ?int $maxLength = null): ?string
+    {
+        if ($value === null) {
+            return null;
+        }
+        $text = trim((string) $value);
+        if ($text === '') {
+            return null;
+        }
+        return $maxLength !== null ? mb_substr($text, 0, $maxLength) : $text;
+    }
+
+    private static function nullableDecimal(mixed $value): ?float
+    {
+        if ($value === null || $value === '' || !is_numeric($value)) {
+            return null;
+        }
+        return round(max(0.0, min(9999.999, (float) $value)), 3);
+    }
+
+    private static function nullableCount(mixed $value): ?int
+    {
+        if ($value === null || $value === '' || !is_numeric($value)) {
+            return null;
+        }
+        $count = (int) $value;
+        return $count > 0 ? min($count, 9999) : null;
+    }
+
+
+
+    public function deleteSpec(int $id): void
+
+    {
+
+        $this->execute('DELETE FROM label_specs WHERE id = :id', ['id' => $id]);
+
+    }
+
+    /**
+     * 편집기 배치에 쓰는 규격값 전수 + 연결 상품 수.
+     * 값이 어긋나면 미리보기·인쇄가 잘리므로 관리자 대시보드에서 점검한다.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function specsForGeometryCheck(): array
+    {
+        return $this->fetchAll(
+            "SELECT s.id, s.name, s.paper_size, s.width_mm, s.height_mm, s.labels_per_sheet,
+                    s.columns_count, s.rows_count, s.top_margin_mm, s.left_margin_mm,
+                    s.h_gap_mm, s.v_gap_mm,
+                    COUNT(p.id) AS product_count, MIN(p.sku) AS sample_sku
+             FROM label_specs s
+             LEFT JOIN shop_products p ON p.spec_id = s.id
+             WHERE s.is_active = 1
+             GROUP BY s.id
+             ORDER BY product_count DESC, s.id ASC"
+        );
+    }
+
+
+
+    /** @return array<int, array<string, mixed>> */
+
+    public function allProducts(): array
+
+    {
+
+        return $this->fetchAll(
+
+            'SELECT p.*, c.name AS category_name, s.name AS spec_name
+
+             FROM shop_products p
+
+             LEFT JOIN shop_categories c ON c.id = p.category_id
+
+             LEFT JOIN label_specs s ON s.id = p.spec_id
+
+             ORDER BY p.sort_order ASC, p.id DESC'
+
+        );
+
+    }
+
+    /**
+     * @param array<string, mixed> $filters
+     * @return array{items: array<int, array<string, mixed>>, total: int, page: int, pages: int}
+     */
+    public function adminProducts(array $filters = [], int $page = 1, int $perPage = 20): array
+    {
+        $page = max(1, $page);
+        $perPage = max(1, min(100, $perPage));
+        [$where, $params] = $this->productFilterClause($filters);
+
+        $countRow = $this->fetchOne(
+            "SELECT COUNT(*) AS cnt
+             FROM shop_products p
+             LEFT JOIN shop_categories c ON c.id = p.category_id
+             LEFT JOIN label_specs s ON s.id = p.spec_id
+             WHERE {$where}",
+            $params
+        );
+        $total = (int) ($countRow['cnt'] ?? 0);
+        $pages = max(1, (int) ceil($total / $perPage));
+        if ($page > $pages) {
+            $page = $pages;
+        }
+        $offset = ($page - 1) * $perPage;
+
+        $items = $this->fetchAll(
+            "SELECT p.*,
+                    c.name AS category_name,
+                    c.parent_id AS category_parent_id,
+                    c.is_active AS category_is_active,
+                    pc.name AS parent_category_name,
+                    s.name AS spec_name
+             FROM shop_products p
+             LEFT JOIN shop_categories c ON c.id = p.category_id
+             LEFT JOIN shop_categories pc ON pc.id = c.parent_id
+             LEFT JOIN label_specs s ON s.id = p.spec_id
+             WHERE {$where}
+             ORDER BY p.sort_order ASC, p.id DESC
+             LIMIT {$perPage} OFFSET {$offset}",
+            $params
+        );
+
+        return ['items' => $items, 'total' => $total, 'page' => $page, 'pages' => $pages];
+    }
+
+    public function saveProduct(array $data): int
+
+    {
+
+        $now = date('Y-m-d H:i:s');
+
+        $id = (int) ($data['id'] ?? 0);
+
+        $params = [
+
+            'category_id' => (int) $data['category_id'],
+
+            'spec_id' => !empty($data['spec_id']) ? (int) $data['spec_id'] : null,
+
+            'name' => $data['name'],
+
+            'sku' => $data['sku'],
+
+            'price' => (int) $data['price'],
+
+            'sale_price' => $data['sale_price'] !== null && $data['sale_price'] !== '' ? (int) $data['sale_price'] : null,
+
+            'ink_amount' => isset($data['ink_amount']) && $data['ink_amount'] !== '' && (int) $data['ink_amount'] > 0 ? (int) $data['ink_amount'] : null,
+
+            'stock_qty' => (int) $data['stock_qty'],
+
+            'status' => $data['status'] ?? 'draft',
+
+            'description' => $data['description'] ?? '',
+
+            'meta_json' => $this->encodeMetaJson($data['meta_json'] ?? null),
+
+            'sort_order' => (int) ($data['sort_order'] ?? 0),
+
+            'thumbnail' => $data['thumbnail'] ?? null,
+
+            'compat_formtec' => $this->compatCodes($data['compat_formtec'] ?? null),
+
+            'compat_ilabel' => $this->compatCodes($data['compat_ilabel'] ?? null),
+
+            'compat_anylabel' => $this->compatCodes($data['compat_anylabel'] ?? null),
+
+            'now' => $now,
+
+        ];
+
+        if ($id > 0) {
+
+            $this->execute(
+
+                'UPDATE shop_products SET category_id=:category_id,spec_id=:spec_id,name=:name,sku=:sku,price=:price,sale_price=:sale_price,ink_amount=:ink_amount,stock_qty=:stock_qty,status=:status,description=:description,meta_json=:meta_json,compat_formtec=:compat_formtec,compat_ilabel=:compat_ilabel,compat_anylabel=:compat_anylabel,sort_order=:sort_order,thumbnail=:thumbnail,updated_at=:now WHERE id=:id',
+
+                $params + ['id' => $id]
+
+            );
+
+            return $id;
+
+        }
+
+        $insertParams = [
+            'category_id' => $params['category_id'],
+            'spec_id' => $params['spec_id'],
+            'name' => $params['name'],
+            'sku' => $params['sku'],
+            'price' => $params['price'],
+            'sale_price' => $params['sale_price'],
+            'ink_amount' => $params['ink_amount'],
+            'stock_qty' => $params['stock_qty'],
+            'status' => $params['status'],
+            'description' => $params['description'],
+            'meta_json' => $params['meta_json'],
+            'sort_order' => $params['sort_order'],
+            'thumbnail' => $params['thumbnail'],
+            'compat_formtec' => $params['compat_formtec'],
+            'compat_ilabel' => $params['compat_ilabel'],
+            'compat_anylabel' => $params['compat_anylabel'],
+            'created_at' => $now,
+            'updated_at' => $now,
+        ];
+
+        $this->execute(
+
+            'INSERT INTO shop_products (category_id,spec_id,name,sku,price,sale_price,ink_amount,stock_qty,status,description,meta_json,compat_formtec,compat_ilabel,compat_anylabel,sort_order,thumbnail,created_at,updated_at) VALUES (:category_id,:spec_id,:name,:sku,:price,:sale_price,:ink_amount,:stock_qty,:status,:description,:meta_json,:compat_formtec,:compat_ilabel,:compat_anylabel,:sort_order,:thumbnail,:created_at,:updated_at)',
+
+            $insertParams
+
+        );
+
+        return (int) $this->lastInsertId();
+
+    }
+
+
+
+    public function deleteProduct(int $id): void
+
+    {
+
+        $this->execute('DELETE FROM shop_product_options WHERE product_id = :id', ['id' => $id]);
+
+        $this->execute('DELETE FROM shop_products WHERE id = :id', ['id' => $id]);
+
+    }
+
+    /**
+     * SKU 만 따로 바꾼다. 신규 임포트가 기본 품번(A101)을 쓰려면 그 자리를 점유한
+     * 구 상품을 원래 품번(A101-20)으로 되돌려야 한다. 다른 값은 건드리지 않는다.
+     */
+    public function updateProductSku(int $id, string $sku): void
+    {
+        $this->execute(
+            'UPDATE shop_products SET sku = :sku, updated_at = :now WHERE id = :id',
+            ['sku' => $sku, 'now' => date('Y-m-d H:i:s'), 'id' => $id]
+        );
+    }
+
+    /**
+     * meta_json 에 지정한 임포트 배치 표시가 없는 상품 — 즉 신규 등록분이 아닌 구 상품.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function productsNotInImportBatch(string $batch): array
+    {
+        return $this->fetchAll(
+            'SELECT id, sku, name, status, category_id, meta_json
+             FROM shop_products
+             WHERE meta_json IS NULL
+                OR meta_json NOT LIKE :needle
+             ORDER BY id ASC',
+            ['needle' => '%"' . self::IMPORT_BATCH_META_KEY . '":"' . $batch . '"%']
+        );
+    }
+
+    /**
+     * 상품에 딸린 행 수를 센다. 삭제 전 미리보기와 삭제 결과 보고에 쓴다.
+     *
+     * @return array<string, int>
+     */
+    public function productRelationCounts(int $id): array
+    {
+        $counts = [];
+        foreach (self::PRODUCT_CHILD_TABLES as $table) {
+            $row = $this->fetchOne("SELECT COUNT(*) AS cnt FROM {$table} WHERE product_id = :id", ['id' => $id]);
+            $counts[$table] = (int) ($row['cnt'] ?? 0);
+        }
+        $row = $this->fetchOne('SELECT COUNT(*) AS cnt FROM shop_order_items WHERE product_id = :id', ['id' => $id]);
+        $counts['shop_order_items'] = (int) ($row['cnt'] ?? 0);
+        return $counts;
+    }
+
+    /**
+     * 상품과 딸린 행(옵션·이미지·상세페이지·찜)을 모두 지운다.
+     * 주문 내역(shop_order_items)은 주문 당시 스냅샷이라 남겨 둔다.
+     */
+    public function purgeProduct(int $id): void
+    {
+        foreach (self::PRODUCT_CHILD_TABLES as $table) {
+            $this->execute("DELETE FROM {$table} WHERE product_id = :id", ['id' => $id]);
+        }
+        $this->execute('DELETE FROM shop_products WHERE id = :id', ['id' => $id]);
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function productOptions(int $productId, bool $activeOnly = false): array
+    {
+        if ($productId <= 0) {
+            return [];
+        }
+        $cond = $activeOnly ? ' AND is_active = 1' : '';
+        return $this->fetchAll(
+            'SELECT * FROM shop_product_options
+             WHERE product_id = :pid' . $cond . '
+             ORDER BY sort_order ASC, id ASC',
+            ['pid' => $productId]
+        );
+    }
+
+    /** @return array<string, mixed>|null */
+    public function findProductOption(int $productId, int $optionId, bool $activeOnly = true): ?array
+    {
+        if ($productId <= 0 || $optionId <= 0) {
+            return null;
+        }
+        $cond = $activeOnly ? ' AND is_active = 1' : '';
+        $row = $this->fetchOne(
+            'SELECT * FROM shop_product_options
+             WHERE id = :id AND product_id = :pid' . $cond . '
+             LIMIT 1',
+            ['id' => $optionId, 'pid' => $productId]
+        );
+        return $row ?: null;
+    }
+
+    /**
+     * 관리자 상품 목록에서 N+1 쿼리를 피하려고 전체 옵션을 한 번에 가져온다.
+     *
+     * @return array<int, array<int, array<string, mixed>>>
+     */
+    public function allProductOptionsGrouped(): array
+    {
+        $rows = $this->fetchAll(
+            'SELECT * FROM shop_product_options ORDER BY product_id ASC, sort_order ASC, id ASC'
+        );
+        $out = [];
+        foreach ($rows as $row) {
+            $out[(int) $row['product_id']][] = $row;
+        }
+        return $out;
+    }
+
+    /**
+     * 전달된 목록을 그대로 반영한다. 빠진 옵션은 삭제하되,
+     * 주문 내역은 shop_order_items에 스냅샷으로 남으므로 영향받지 않는다.
+     *
+     * @param array<int, array<string, mixed>> $options
+     */
+    public function syncProductOptions(int $productId, array $options): void
+    {
+        if ($productId <= 0) {
+            return;
+        }
+        $now = date('Y-m-d H:i:s');
+        $keepIds = [];
+
+        foreach (array_values($options) as $index => $option) {
+            $name = trim((string) ($option['name'] ?? ''));
+            if ($name === '') {
+                continue;
+            }
+            $params = [
+                'product_id' => $productId,
+                'name' => mb_substr($name, 0, 120),
+                'price_delta' => (int) ($option['price_delta'] ?? 0),
+                'stock_qty' => max(0, (int) ($option['stock_qty'] ?? 0)),
+                'sku_suffix' => $this->nullableText($option['sku_suffix'] ?? null),
+                'is_active' => !empty($option['is_active']) ? 1 : 0,
+                'sort_order' => (int) ($option['sort_order'] ?? $index),
+                'now' => $now,
+            ];
+            $optionId = (int) ($option['id'] ?? 0);
+            if ($optionId > 0) {
+                $params['id'] = $optionId;
+                $this->execute(
+                    'UPDATE shop_product_options
+                     SET name = :name, price_delta = :price_delta, stock_qty = :stock_qty,
+                         sku_suffix = :sku_suffix, is_active = :is_active, sort_order = :sort_order,
+                         updated_at = :now
+                     WHERE id = :id AND product_id = :product_id',
+                    $params
+                );
+                $keepIds[] = $optionId;
+                continue;
+            }
+            $this->execute(
+                'INSERT INTO shop_product_options
+                    (product_id, name, price_delta, stock_qty, sku_suffix, is_active, sort_order, created_at, updated_at)
+                 VALUES
+                    (:product_id, :name, :price_delta, :stock_qty, :sku_suffix, :is_active, :sort_order, :now, :now)',
+                $params
+            );
+            $keepIds[] = (int) $this->lastInsertId();
+        }
+
+        if ($keepIds === []) {
+            $this->execute('DELETE FROM shop_product_options WHERE product_id = :pid', ['pid' => $productId]);
+            return;
+        }
+        $placeholders = [];
+        $params = ['pid' => $productId];
+        foreach ($keepIds as $i => $id) {
+            $key = 'keep' . $i;
+            $placeholders[] = ':' . $key;
+            $params[$key] = $id;
+        }
+        $this->execute(
+            'DELETE FROM shop_product_options
+             WHERE product_id = :pid AND id NOT IN (' . implode(',', $placeholders) . ')',
+            $params
+        );
+    }
+
+
+
+    /** @return array{items: array<int, array<string, mixed>>, total: int, page: int, pages: int} */
+
+    public function paginateOrders(string $status = '', int $page = 1, int $perPage = 20): array
+
+    {
+
+        $page = max(1, $page);
+
+        $total = $this->countOrders($status);
+
+        $pages = max(1, (int) ceil($total / $perPage));
+
+        $where = '1=1';
+
+        $params = [];
+
+        if ($status !== '') {
+
+            $where .= ' AND status = :status';
+
+            $params['status'] = $status;
+
+        }
+
+        $offset = ($page - 1) * $perPage;
+
+        $items = $this->fetchAll(
+
+            "SELECT * FROM shop_orders WHERE {$where} ORDER BY id DESC LIMIT {$perPage} OFFSET {$offset}",
+
+            $params
+
+        );
+
+        return compact('items', 'total', 'page', 'pages') + ['per_page' => $perPage];
+
+    }
+
+
+
+    public function countOrders(string $status = ''): int
+
+    {
+
+        if ($status === '') {
+
+            $row = $this->fetchOne('SELECT COUNT(*) AS cnt FROM shop_orders');
+
+        } else {
+
+            $row = $this->fetchOne('SELECT COUNT(*) AS cnt FROM shop_orders WHERE status = :status', ['status' => $status]);
+
+        }
+
+        return (int) ($row['cnt'] ?? 0);
+
+    }
+
+
+
+    /** @return array<int, array<string, mixed>> */
+
+    public function orderItems(int $orderId): array
+
+    {
+
+        return $this->fetchAll('SELECT * FROM shop_order_items WHERE order_id = :id ORDER BY id ASC', ['id' => $orderId]);
+
+    }
+
+
+
+    public function updateOrder(int $id, array $data): void
+
+    {
+
+        $this->execute(
+
+            'UPDATE shop_orders SET status=:status,payment_status=:payment_status,admin_memo=:admin_memo,carrier=:carrier,tracking_no=:tracking_no,updated_at=:now WHERE id=:id',
+
+            [
+
+                'status' => $data['status'],
+
+                'payment_status' => $data['payment_status'],
+
+                'admin_memo' => $data['admin_memo'] ?? '',
+
+                'carrier' => $data['carrier'] ?? '',
+
+                'tracking_no' => $data['tracking_no'] ?? '',
+
+                'now' => date('Y-m-d H:i:s'),
+
+                'id' => $id,
+
+            ]
+
+        );
+
+    }
+
+
+
+    /** @return array<int, array<string, mixed>> */
+
+    public function shippingOrders(): array
+
+    {
+
+        return $this->fetchAll(
+
+            "SELECT * FROM shop_orders WHERE status IN ('paid','preparing','shipping') ORDER BY FIELD(status,'preparing','paid','shipping'), id DESC"
+
+        );
+
+    }
+
+
+
+    /** @return array<int, array<string, mixed>> */
+
+    public function allCoupons(): array
+
+    {
+
+        return $this->fetchAll('SELECT * FROM shop_coupons ORDER BY id DESC');
+
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function activeCoupons(): array
+    {
+        return $this->fetchAll(
+            'SELECT * FROM shop_coupons
+             WHERE is_active = 1
+               AND (starts_at IS NULL OR starts_at <= NOW())
+               AND (ends_at IS NULL OR ends_at >= NOW())
+               AND (max_uses IS NULL OR used_count < max_uses)
+             ORDER BY (ends_at IS NULL) ASC, ends_at ASC, id DESC'
+        );
+    }
+
+    /** @return array<string, mixed>|null */
+    public function findCouponByCode(string $code): ?array
+    {
+        $code = strtoupper(trim($code));
+        if ($code === '') {
+            return null;
+        }
+        $row = $this->fetchOne(
+            'SELECT * FROM shop_coupons WHERE code = :code LIMIT 1',
+            ['code' => $code]
+        );
+        return $row ?: null;
+    }
+
+    public function incrementCouponUse(string $code): void
+    {
+        $code = strtoupper(trim($code));
+        if ($code === '') {
+            return;
+        }
+        $this->execute(
+            'UPDATE shop_coupons
+             SET used_count = used_count + 1, updated_at = :now
+             WHERE code = :code
+               AND (max_uses IS NULL OR used_count < max_uses)',
+            ['now' => date('Y-m-d H:i:s'), 'code' => $code]
+        );
+    }
+
+    public function saveCoupon(array $data): int
+
+    {
+
+        $now = date('Y-m-d H:i:s');
+
+        $id = (int) ($data['id'] ?? 0);
+
+        $params = [
+
+            'code' => strtoupper(trim($data['code'])),
+
+            'name' => $data['name'],
+
+            'discount_type' => $data['discount_type'] ?? 'fixed',
+
+            'discount_value' => (int) $data['discount_value'],
+
+            'min_order_amount' => (int) ($data['min_order_amount'] ?? 0),
+
+            'max_uses' => $data['max_uses'] !== null && $data['max_uses'] !== '' ? (int) $data['max_uses'] : null,
+
+            'starts_at' => $data['starts_at'] ?: null,
+
+            'ends_at' => $data['ends_at'] ?: null,
+
+            'is_active' => (int) !empty($data['is_active']),
+
+            'now' => $now,
+
+        ];
+
+        if ($id > 0) {
+
+            $this->execute(
+
+                'UPDATE shop_coupons SET code=:code,name=:name,discount_type=:discount_type,discount_value=:discount_value,min_order_amount=:min_order_amount,max_uses=:max_uses,starts_at=:starts_at,ends_at=:ends_at,is_active=:is_active,updated_at=:now WHERE id=:id',
+
+                $params + ['id' => $id]
+
+            );
+
+            return $id;
+
+        }
+
+        $this->execute(
+
+            'INSERT INTO shop_coupons (code,name,discount_type,discount_value,min_order_amount,max_uses,starts_at,ends_at,is_active,created_at,updated_at) VALUES (:code,:name,:discount_type,:discount_value,:min_order_amount,:max_uses,:starts_at,:ends_at,:is_active,:now,:now)',
+
+            $params
+
+        );
+
+        return (int) $this->lastInsertId();
+
+    }
+
+
+
+    public function deleteCoupon(int $id): void
+
+    {
+
+        $this->execute('DELETE FROM shop_coupons WHERE id = :id', ['id' => $id]);
+
+    }
+
+
+
+    /** @return array<int, array<string, mixed>> */
+
+    public function allBanners(): array
+
+    {
+
+        return $this->fetchAll('SELECT * FROM shop_banners ORDER BY sort_order ASC, id DESC');
+
+    }
+
+
+
+    public function saveBanner(array $data): int
+
+    {
+
+        $now = date('Y-m-d H:i:s');
+
+        $id = (int) ($data['id'] ?? 0);
+
+        $params = [
+
+            'title' => $data['title'],
+
+            'subtitle' => $data['subtitle'] ?? '',
+
+            'image_url' => $data['image_url'] ?? '',
+
+            'link_url' => $data['link_url'] ?? '',
+
+            'sort_order' => (int) ($data['sort_order'] ?? 0),
+
+            'is_active' => (int) !empty($data['is_active']),
+
+            'now' => $now,
+
+        ];
+
+        if ($id > 0) {
+
+            $this->execute(
+
+                'UPDATE shop_banners SET title=:title,subtitle=:subtitle,image_url=:image_url,link_url=:link_url,sort_order=:sort_order,is_active=:is_active,updated_at=:now WHERE id=:id',
+
+                $params + ['id' => $id]
+
+            );
+
+            return $id;
+
+        }
+
+        $this->execute(
+
+            'INSERT INTO shop_banners (title,subtitle,image_url,link_url,sort_order,is_active,created_at,updated_at) VALUES (:title,:subtitle,:image_url,:link_url,:sort_order,:is_active,:now,:now)',
+
+            $params
+
+        );
+
+        return (int) $this->lastInsertId();
+
+    }
+
+
+
+    public function deleteBanner(int $id): void
+
+    {
+
+        $this->execute('DELETE FROM shop_banners WHERE id = :id', ['id' => $id]);
+
+    }
+
+    /** @return array<string, mixed>|null */
+    public function findUserOrderByNo(int $userId, string $orderNo, string $email = ''): ?array
+    {
+        $row = $this->fetchOne(
+            'SELECT * FROM shop_orders WHERE user_id = :user_id AND order_no = :order_no LIMIT 1',
+            ['user_id' => $userId, 'order_no' => $orderNo]
+        );
+        $email = trim($email);
+        if (!$row && $email !== '') {
+            $row = $this->fetchOne(
+                'SELECT * FROM shop_orders WHERE order_no = :order_no AND customer_email = :email LIMIT 1',
+                ['order_no' => $orderNo, 'email' => $email]
+            );
+        }
+        if (!$row) {
+            return null;
+        }
+        $items = [$row];
+        $this->attachOrderItems($items);
+        return $items[0];
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function ordersByUser(int $userId, int $limit = 5, int $offset = 0): array
+    {
+        $limit = max(1, min(50, $limit));
+        $offset = max(0, $offset);
+        $orders = $this->fetchAll(
+            "SELECT * FROM shop_orders WHERE user_id = :user_id ORDER BY id DESC LIMIT {$limit} OFFSET {$offset}",
+            ['user_id' => $userId]
+        );
+        $this->attachOrderItems($orders);
+        return $orders;
+    }
+
+    public function countOrdersByUser(int $userId, string $status = ''): int
+    {
+        if ($status === '') {
+            $row = $this->fetchOne(
+                'SELECT COUNT(*) AS cnt FROM shop_orders WHERE user_id = :user_id',
+                ['user_id' => $userId]
+            );
+        } else {
+            $row = $this->fetchOne(
+                'SELECT COUNT(*) AS cnt FROM shop_orders WHERE user_id = :user_id AND status = :status',
+                ['user_id' => $userId, 'status' => $status]
+            );
+        }
+        return (int) ($row['cnt'] ?? 0);
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function activeCategories(): array
+    {
+        return $this->asCategoryTree(
+            $this->fetchAll(
+                'SELECT * FROM shop_categories WHERE is_active = 1 ORDER BY sort_order ASC, id ASC'
+            )
+        );
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function activeRootCategories(): array
+    {
+        return array_values(array_filter(
+            $this->activeCategories(),
+            static fn (array $row): bool => (int) ($row['depth'] ?? 0) === 0
+        ));
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function activeBanners(): array
+    {
+        return $this->fetchAll(
+            'SELECT * FROM shop_banners WHERE is_active = 1 ORDER BY sort_order ASC, id ASC'
+        );
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function activeSpecs(int $limit = 8): array
+    {
+        $limit = max(1, min(24, $limit));
+        return $this->fetchAll(
+            "SELECT * FROM label_specs WHERE is_active = 1 ORDER BY labels_per_sheet DESC, id ASC LIMIT {$limit}"
+        );
+    }
+
+    public function findActiveProduct(int $id): ?array
+    {
+        return $this->fetchOne(
+            'SELECT p.*, c.name AS category_name, c.slug AS category_slug,
+                    s.name AS spec_name, s.width_mm, s.height_mm, s.material, s.shape, s.labels_per_sheet,
+                    s.paper_size, s.top_margin_mm, s.left_margin_mm, s.columns_count, s.rows_count,
+                    s.h_gap_mm, s.v_gap_mm, s.corner_radius_x_mm, s.corner_radius_y_mm, s.label_color
+             FROM shop_products p
+             INNER JOIN shop_categories c ON c.id = p.category_id AND c.is_active = 1
+             LEFT JOIN label_specs s ON s.id = p.spec_id
+             WHERE p.id = :id AND p.status IN (\'active\', \'soldout\')
+             LIMIT 1',
+            ['id' => $id]
+        );
+    }
+
+    /** 관리자 미리보기용 — 상태와 무관하게 상품 조회 */
+    public function findProductForPreview(int $id): ?array
+    {
+        return $this->fetchOne(
+            'SELECT p.*, c.name AS category_name, c.slug AS category_slug,
+                    s.name AS spec_name, s.width_mm, s.height_mm, s.material, s.shape, s.labels_per_sheet
+             FROM shop_products p
+             LEFT JOIN shop_categories c ON c.id = p.category_id
+             LEFT JOIN label_specs s ON s.id = p.spec_id
+             WHERE p.id = :id
+             LIMIT 1',
+            ['id' => $id]
+        );
+    }
+
+    public function findActiveProductByCode(string $code, ?float $widthMm = null, ?float $heightMm = null, ?int $labels = null): ?array
+    {
+        $code = trim($code);
+        if ($code === '') {
+            return null;
+        }
+
+        if (preg_match('/^P(\d+)$/i', $code, $m) === 1) {
+            $byId = $this->findActiveProduct((int) $m[1]);
+            if ($byId && $this->productSpecFits($byId, $widthMm, $heightMm, $labels)) {
+                return $byId;
+            }
+        }
+
+        $aliases = $this->paperCodeAliases($code);
+        foreach ($aliases as $i => $alias) {
+            $hit = $this->findActiveProductByExactCode($alias);
+            if (!$hit) {
+                continue;
+            }
+            $strictSize = $i > 0 || $widthMm !== null;
+            if ($strictSize && !$this->productSpecFits($hit, $widthMm, $heightMm, $labels)) {
+                continue;
+            }
+            return $hit;
+        }
+
+        if ($widthMm !== null && $heightMm !== null && $widthMm > 0 && $heightMm > 0) {
+            return $this->findActiveProductBySpec($widthMm, $heightMm, $labels);
+        }
+
+        return null;
+    }
+
+    /** @return list<string> */
+    private function paperCodeAliases(string $code): array
+    {
+        $upper = strtoupper($code);
+        $out = [];
+        foreach ([$code, $upper] as $item) {
+            $item = trim($item);
+            if ($item !== '' && !in_array($item, $out, true)) {
+                $out[] = $item;
+            }
+        }
+        $num = $upper;
+        if (preg_match('/^(?:LU-?|V)(\d{3,5})$/', $upper, $m) === 1) {
+            $num = $m[1];
+        }
+        if (preg_match('/^\d{3,5}$/', $num) === 1) {
+            foreach ([$num, 'V' . $num, 'LU-' . $num, 'LU' . $num] as $item) {
+                if (!in_array($item, $out, true)) {
+                    $out[] = $item;
+                }
+            }
+        }
+        return $out;
+    }
+
+    /**
+     * @param array<string, mixed> $product
+     */
+    private function productSpecFits(array $product, ?float $widthMm, ?float $heightMm, ?int $labels): bool
+    {
+        if ($widthMm === null || $heightMm === null || $widthMm <= 0 || $heightMm <= 0) {
+            return true;
+        }
+        $pw = isset($product['width_mm']) ? (float) $product['width_mm'] : 0.0;
+        $ph = isset($product['height_mm']) ? (float) $product['height_mm'] : 0.0;
+        if ($pw <= 0 || $ph <= 0) {
+            return true;
+        }
+        if (abs($pw - $widthMm) > 1.6 || abs($ph - $heightMm) > 1.6) {
+            return false;
+        }
+        $pl = isset($product['labels_per_sheet']) ? (int) $product['labels_per_sheet'] : 0;
+        if ($labels !== null && $labels > 0 && $pl > 0 && $pl !== $labels) {
+            return false;
+        }
+        return true;
+    }
+
+    private function findActiveProductByExactCode(string $code): ?array
+    {
+        $select = 'SELECT p.*, c.name AS category_name, c.slug AS category_slug,
+                          s.name AS spec_name, s.width_mm, s.height_mm, s.material, s.shape, s.labels_per_sheet,
+                          s.paper_size, s.top_margin_mm, s.left_margin_mm, s.columns_count, s.rows_count,
+                          s.h_gap_mm, s.v_gap_mm, s.corner_radius_x_mm, s.corner_radius_y_mm, s.label_color
+                   FROM shop_products p
+                   INNER JOIN shop_categories c ON c.id = p.category_id AND c.is_active = 1
+                   LEFT JOIN label_specs s ON s.id = p.spec_id
+                   WHERE p.status IN (\'active\', \'soldout\')';
+
+        return $this->fetchOne(
+            $select . " AND (
+                p.sku = :sku
+                OR FIND_IN_SET(:cf, IFNULL(p.compat_formtec, '')) > 0
+                OR FIND_IN_SET(:ci, IFNULL(p.compat_ilabel, '')) > 0
+                OR FIND_IN_SET(:ca, IFNULL(p.compat_anylabel, '')) > 0
+             )
+             ORDER BY CASE WHEN p.sku = :sku_rank THEN 0 ELSE 1 END, p.id DESC
+             LIMIT 1",
+            [
+                'sku' => $code,
+                'cf' => $code,
+                'ci' => $code,
+                'ca' => $code,
+                'sku_rank' => $code,
+            ]
+        );
+    }
+
+    private function findActiveProductBySpec(float $widthMm, float $heightMm, ?int $labels): ?array
+    {
+        $labelFilter = ($labels !== null && $labels > 0)
+            ? ' AND s.labels_per_sheet = :labels'
+            : '';
+        $params = [
+            'wmin' => $widthMm - 1.6,
+            'wmax' => $widthMm + 1.6,
+            'hmin' => $heightMm - 1.6,
+            'hmax' => $heightMm + 1.6,
+            'w' => $widthMm,
+            'h' => $heightMm,
+        ];
+        if ($labelFilter !== '') {
+            $params['labels'] = $labels;
+        }
+
+        return $this->fetchOne(
+            "SELECT p.*, c.name AS category_name, c.slug AS category_slug,
+                    s.name AS spec_name, s.width_mm, s.height_mm, s.material, s.shape, s.labels_per_sheet,
+                    s.paper_size, s.top_margin_mm, s.left_margin_mm, s.columns_count, s.rows_count,
+                    s.h_gap_mm, s.v_gap_mm, s.corner_radius_x_mm, s.corner_radius_y_mm, s.label_color
+             FROM shop_products p
+             INNER JOIN shop_categories c ON c.id = p.category_id AND c.is_active = 1
+             INNER JOIN label_specs s ON s.id = p.spec_id
+             WHERE p.status IN ('active', 'soldout')
+               AND s.width_mm BETWEEN :wmin AND :wmax
+               AND s.height_mm BETWEEN :hmin AND :hmax
+               {$labelFilter}
+             ORDER BY ABS(s.width_mm - :w) + ABS(s.height_mm - :h) ASC,
+                      CASE WHEN p.sku LIKE '%-100' THEN 0 ELSE 1 END,
+                      p.id DESC
+             LIMIT 1",
+            $params
+        );
+    }
+
+    /**
+     * @return array{items: array<int, array<string, mixed>>, total: int, page: int, pages: int, per_page: int}
+     */
+    public function activeProducts(array $filters = [], int $page = 1, int $perPage = 12): array
+    {
+        $page = max(1, $page);
+        $total = $this->countActiveProducts($filters);
+        $pages = max(1, (int) ceil($total / $perPage));
+        $offset = ($page - 1) * $perPage;
+
+        [$where, $params] = $this->productFilterClause($filters);
+        $items = $this->fetchAll(
+            "SELECT p.*, c.name AS category_name, c.slug AS category_slug,
+                    s.name AS spec_name, s.width_mm, s.height_mm, s.material, s.shape, s.labels_per_sheet
+             FROM shop_products p
+             INNER JOIN shop_categories c ON c.id = p.category_id AND c.is_active = 1
+             LEFT JOIN label_specs s ON s.id = p.spec_id
+             WHERE p.status IN ('active','soldout') AND {$where}
+             ORDER BY p.sort_order ASC, p.id DESC
+             LIMIT {$perPage} OFFSET {$offset}",
+            $params
+        );
+
+        return ['items' => $items, 'total' => $total, 'page' => $page, 'pages' => $pages, 'per_page' => $perPage];
+    }
+
+    /**
+     * 홈 인기 용지 — 메인 라인업(정렬순) 라벨지. 잉크 상품은 제외.
+     *
+     * @return array<int, array<string, mixed>>
+     */
+    public function popularPapersForHome(int $limit = 12): array
+    {
+        $limit = max(1, min(24, $limit));
+        return $this->fetchAll(
+            "SELECT p.*, c.name AS category_name, c.slug AS category_slug,
+                    s.name AS spec_name, s.width_mm, s.height_mm, s.material, s.shape, s.labels_per_sheet
+             FROM shop_products p
+             INNER JOIN shop_categories c ON c.id = p.category_id AND c.is_active = 1
+             LEFT JOIN label_specs s ON s.id = p.spec_id
+             WHERE p.status IN ('active','soldout')
+               AND (p.ink_amount IS NULL OR p.ink_amount = 0)
+             ORDER BY p.sort_order ASC, p.id DESC
+             LIMIT {$limit}"
+        );
+    }
+
+    /**
+     * 편집기 용지 선택용 — 판매중/품절 상품 + 규격 + 호환코드.
+     *
+     * @return array{items: array<int, array<string, mixed>>, categories: array<int, array{id:int,name:string}>}
+     */
+    public function editorPapers(): array
+    {
+        $rows = $this->fetchAll(
+            "SELECT p.id, p.name, p.sku, p.thumbnail, p.category_id, p.spec_id, p.status,
+                    p.compat_formtec, p.compat_ilabel, p.compat_anylabel,
+                    c.name AS category_name, c.slug AS category_slug,
+                    s.name AS spec_name, s.kind AS spec_kind, s.width_mm, s.height_mm, s.material, s.shape, s.labels_per_sheet,
+                    s.paper_size, s.top_margin_mm, s.left_margin_mm, s.columns_count, s.rows_count,
+                    s.h_gap_mm, s.v_gap_mm, s.corner_radius_x_mm, s.corner_radius_y_mm,
+                    s.label_color, s.custom_path_svg
+             FROM shop_products p
+             LEFT JOIN shop_categories c ON c.id = p.category_id
+             LEFT JOIN label_specs s ON s.id = p.spec_id
+             WHERE p.status IN ('active','soldout')
+               AND (p.ink_amount IS NULL OR p.ink_amount = 0)
+             ORDER BY p.sort_order ASC, p.name ASC, p.id DESC
+             LIMIT 500"
+        );
+
+        $items = [];
+        $categories = [];
+        foreach ($rows as $row) {
+            $categoryId = (int) ($row['category_id'] ?? 0);
+            $categoryName = shop_category_display_name(
+                (string) ($row['category_name'] ?? ''),
+                (string) ($row['category_slug'] ?? '')
+            );
+            if ($categoryId > 0 && $categoryName !== '' && !isset($categories[$categoryId])) {
+                $categories[$categoryId] = ['id' => $categoryId, 'name' => $categoryName];
+            }
+            $items[] = [
+                'id' => (int) ($row['id'] ?? 0),
+                'name' => (string) ($row['name'] ?? ''),
+                'sku' => (string) ($row['sku'] ?? ''),
+                'kind' => self::normalizePaperKind(
+                    $row['spec_kind'] ?? null,
+                    $categoryName . ' ' . (string) ($row['name'] ?? '') . ' ' . (string) ($row['sku'] ?? '') . ' ' . (string) ($row['spec_name'] ?? '')
+                ),
+                'thumbnailUrl' => ShopProductImageService::resolveUrl((string) ($row['thumbnail'] ?? '')),
+                'categoryId' => $categoryId,
+                'categoryName' => $categoryName,
+                'specId' => !empty($row['spec_id']) ? (int) $row['spec_id'] : null,
+                'specName' => (string) ($row['spec_name'] ?? ''),
+                'widthMm' => (float) ($row['width_mm'] ?? 0),
+                'heightMm' => (float) ($row['height_mm'] ?? 0),
+                'shape' => (string) ($row['shape'] ?? ''),
+                'labelsPerSheet' => (int) ($row['labels_per_sheet'] ?? 0),
+                'material' => (string) ($row['material'] ?? ''),
+                // 편집기 미리보기·인쇄가 쓰는 실제 배치값. 값이 없으면 null로 내려서 편집기가 추정하게 둔다.
+                'paperSize' => self::nullableString($row['paper_size'] ?? null, 20),
+                'topMarginMm' => self::nullableDecimal($row['top_margin_mm'] ?? null),
+                'leftMarginMm' => self::nullableDecimal($row['left_margin_mm'] ?? null),
+                'columnsCount' => self::nullableCount($row['columns_count'] ?? null),
+                'rowsCount' => self::nullableCount($row['rows_count'] ?? null),
+                'hGapMm' => self::nullableDecimal($row['h_gap_mm'] ?? null),
+                'vGapMm' => self::nullableDecimal($row['v_gap_mm'] ?? null),
+                'cornerRadiusXMm' => self::nullableDecimal($row['corner_radius_x_mm'] ?? null),
+                'cornerRadiusYMm' => self::nullableDecimal($row['corner_radius_y_mm'] ?? null),
+                'labelColor' => self::nullableString($row['label_color'] ?? null, 7),
+                'customPathSvg' => self::nullableString($row['custom_path_svg'] ?? null),
+                'compatFormtec' => (string) ($row['compat_formtec'] ?? ''),
+                'compatIlabel' => (string) ($row['compat_ilabel'] ?? ''),
+                'compatAnylabel' => (string) ($row['compat_anylabel'] ?? ''),
+            ];
+        }
+
+        return [
+            'items' => $items,
+            'categories' => array_values($categories),
+        ];
+    }
+
+    /**
+     * 공개 호환코드표용 — 판매중/품절 상품 + 규격 + 호환코드.
+     *
+     * @return list<array<string, mixed>>
+     */
+    public function compatCodeCatalog(int $limit = 3000): array
+    {
+        $limit = max(1, min(5000, $limit));
+        return $this->fetchAll(
+            "SELECT p.id, p.name, p.sku, p.category_id, p.spec_id, p.status, p.meta_json,
+                    p.compat_formtec, p.compat_ilabel, p.compat_anylabel, p.sort_order,
+                    c.name AS category_name, c.slug AS category_slug, c.sort_order AS category_sort,
+                    s.name AS spec_name, s.width_mm, s.height_mm, s.material, s.shape, s.labels_per_sheet
+             FROM shop_products p
+             LEFT JOIN shop_categories c ON c.id = p.category_id
+             LEFT JOIN label_specs s ON s.id = p.spec_id
+             WHERE p.status IN ('active','soldout')
+               AND (
+                    IFNULL(p.compat_formtec,'') <> ''
+                 OR IFNULL(p.compat_ilabel,'') <> ''
+                 OR IFNULL(p.compat_anylabel,'') <> ''
+               )
+             ORDER BY COALESCE(c.sort_order, 9999) ASC, c.name ASC, p.sort_order ASC, p.sku ASC, p.id ASC
+             LIMIT {$limit}"
+        );
+    }
+
+    public function countActiveProducts(array $filters = []): int
+    {
+        [$where, $params] = $this->productFilterClause($filters);
+        $row = $this->fetchOne(
+            "SELECT COUNT(*) AS cnt
+             FROM shop_products p
+             INNER JOIN shop_categories c ON c.id = p.category_id AND c.is_active = 1
+             LEFT JOIN label_specs s ON s.id = p.spec_id
+             WHERE p.status IN ('active','soldout') AND {$where}",
+            $params
+        );
+        return (int) ($row['cnt'] ?? 0);
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function productsGroupedByMaterial(int $perGroup = 4): array
+    {
+        $perGroup = max(1, min(8, $perGroup));
+        return $this->fetchAll(
+            "SELECT p.*, c.name AS category_name, s.material, s.width_mm, s.height_mm, s.labels_per_sheet
+             FROM shop_products p
+             INNER JOIN shop_categories c ON c.id = p.category_id AND c.is_active = 1
+             LEFT JOIN label_specs s ON s.id = p.spec_id
+             WHERE p.status = 'active' AND s.material IS NOT NULL AND s.material != ''
+             ORDER BY s.material ASC, p.sort_order ASC, p.id DESC
+             LIMIT " . ($perGroup * 6)
+        );
+    }
+
+    /** @return array<int, array<string, mixed>> */
+    public function productImages(int $productId): array
+    {
+        return $this->fetchAll(
+            'SELECT * FROM shop_product_images WHERE product_id = :pid ORDER BY sort_order ASC, id ASC',
+            ['pid' => $productId]
+        );
+    }
+
+    /** @param array<int, array{image_path:string,sort_order?:int,is_primary?:bool|int}> $images */
+    public function syncProductImages(int $productId, array $images, ?string $thumbnail = null): void
+    {
+        $this->execute('DELETE FROM shop_product_images WHERE product_id = :pid', ['pid' => $productId]);
+        $now = date('Y-m-d H:i:s');
+
+        $normalized = [];
+        foreach (array_values($images) as $i => $img) {
+            $path = ShopProductImageService::normalizePublicPath((string) ($img['image_path'] ?? ''));
+            if ($path === '') {
+                continue;
+            }
+            $normalized[] = [
+                'path' => $path,
+                'sort_order' => (int) ($img['sort_order'] ?? $i),
+                'is_primary' => !empty($img['is_primary']),
+            ];
+        }
+
+        if ($normalized === []) {
+            $this->execute(
+                'UPDATE shop_products SET thumbnail = NULL, updated_at = :updated_at WHERE id = :id',
+                ['updated_at' => $now, 'id' => $productId]
+            );
+            return;
+        }
+
+        $primaryIdx = 0;
+        $thumbNorm = $thumbnail ? ShopProductImageService::normalizePublicPath($thumbnail) : '';
+        if ($thumbNorm !== '') {
+            foreach ($normalized as $i => $item) {
+                if ($item['path'] === $thumbNorm) {
+                    $primaryIdx = $i;
+                    break;
+                }
+            }
+        } else {
+            foreach ($normalized as $i => $item) {
+                if ($item['is_primary']) {
+                    $primaryIdx = $i;
+                    break;
+                }
+            }
+        }
+
+        $primaryPath = $normalized[$primaryIdx]['path'];
+        foreach ($normalized as $i => $item) {
+            $isPrimary = ($i === $primaryIdx);
+            $this->execute(
+                'INSERT INTO shop_product_images (product_id, image_path, sort_order, is_primary, created_at, updated_at)
+                 VALUES (:product_id, :image_path, :sort_order, :is_primary, :created_at, :updated_at)',
+                [
+                    'product_id' => $productId,
+                    'image_path' => $item['path'],
+                    'sort_order' => $item['sort_order'],
+                    'is_primary' => $isPrimary ? 1 : 0,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]
+            );
+        }
+
+        $this->execute(
+            'UPDATE shop_products SET thumbnail = :thumb, updated_at = :updated_at WHERE id = :id',
+            ['thumb' => $primaryPath, 'updated_at' => $now, 'id' => $productId]
+        );
+    }
+
+    /** @return array<int, array<int, array<string, mixed>>> */
+    public function allProductImagesGrouped(): array
+    {
+        $rows = $this->fetchAll('SELECT * FROM shop_product_images ORDER BY product_id ASC, sort_order ASC, id ASC');
+        $grouped = [];
+        foreach ($rows as $row) {
+            $grouped[(int) $row['product_id']][] = $row;
+        }
+        return $grouped;
+    }
+
+    private function encodeMetaJson(mixed $meta): ?string
+    {
+        if ($meta === null || $meta === '') {
+            return null;
+        }
+        if (is_string($meta)) {
+            return $meta;
+        }
+        if (!is_array($meta)) {
+            return null;
+        }
+        $clean = array_filter($meta, static fn ($v) => $v !== null && $v !== '');
+        if ($clean === []) {
+            return null;
+        }
+
+        return json_encode($clean, JSON_UNESCAPED_UNICODE);
+    }
+
+    /** @return array{0:string,1:array<string,mixed>} */
+    private function productFilterClause(array $filters): array
+    {
+        $where = '1=1';
+        $params = [];
+
+        if (!empty($filters['category_id'])) {
+            $where .= ' AND (p.category_id = :category_id OR c.parent_id = :category_id_parent)';
+            $params['category_id'] = (int) $filters['category_id'];
+            $params['category_id_parent'] = (int) $filters['category_id'];
+        }
+        if (!empty($filters['category_slug'])) {
+            $where .= ' AND (c.slug = :category_slug OR c.parent_id = (
+                SELECT sc_filter.id FROM shop_categories sc_filter WHERE sc_filter.slug = :category_slug_parent LIMIT 1
+            ))';
+            $params['category_slug'] = (string) $filters['category_slug'];
+            $params['category_slug_parent'] = (string) $filters['category_slug'];
+        }
+        if (!empty($filters['material'])) {
+            $where .= ' AND s.material LIKE :material';
+            $params['material'] = '%' . $filters['material'] . '%';
+        }
+        if (!empty($filters['q'])) {
+            $where .= ' AND (p.name LIKE :q_name OR p.sku LIKE :q_sku OR p.description LIKE :q_desc OR s.name LIKE :q_spec'
+                . ' OR p.compat_formtec LIKE :q_formtec OR p.compat_ilabel LIKE :q_ilabel OR p.compat_anylabel LIKE :q_anylabel)';
+            $like = '%' . $filters['q'] . '%';
+            $params['q_name'] = $like;
+            $params['q_sku'] = $like;
+            $params['q_desc'] = $like;
+            $params['q_spec'] = $like;
+            $params['q_formtec'] = $like;
+            $params['q_ilabel'] = $like;
+            $params['q_anylabel'] = $like;
+        }
+        if (!empty($filters['shape'])) {
+            $where .= ' AND s.shape = :shape';
+            $params['shape'] = (string) $filters['shape'];
+        }
+        if (!empty($filters['status'])) {
+            $where .= ' AND p.status = :status';
+            $params['status'] = (string) $filters['status'];
+        }
+        if (!empty($filters['spec_id'])) {
+            $where .= ' AND p.spec_id = :spec_id';
+            $params['spec_id'] = (int) $filters['spec_id'];
+        }
+        if (!empty($filters['compat_missing'])) {
+            $where .= " AND IFNULL(p.compat_formtec,'') = '' AND IFNULL(p.compat_ilabel,'') = '' AND IFNULL(p.compat_anylabel,'') = ''";
+        }
+
+        return [$where, $params];
+    }
+
+    public function updateProductCompat(int $id, array $codes): void
+    {
+        $this->execute(
+            'UPDATE shop_products
+             SET compat_formtec = :compat_formtec, compat_ilabel = :compat_ilabel, compat_anylabel = :compat_anylabel, updated_at = :now
+             WHERE id = :id',
+            [
+                'compat_formtec' => $this->compatCodes($codes['compat_formtec'] ?? null),
+                'compat_ilabel' => $this->compatCodes($codes['compat_ilabel'] ?? null),
+                'compat_anylabel' => $this->compatCodes($codes['compat_anylabel'] ?? null),
+                'now' => date('Y-m-d H:i:s'),
+                'id' => $id,
+            ]
+        );
+    }
+
+    /**
+     * @param array<string, mixed> $filters
+     * @return array{items: array<int, array<string, mixed>>, total: int, page: int, pages: int, per_page: int}
+     */
+    public function paginateAdminOrders(array $filters = [], int $page = 1, int $perPage = 20): array
+    {
+        $page = max(1, $page);
+        $perPage = max(1, min(5000, $perPage));
+        [$where, $params] = $this->orderFilterClause($filters);
+
+        $countRow = $this->fetchOne(
+            "SELECT COUNT(*) AS cnt FROM shop_orders o WHERE {$where}",
+            $params
+        );
+        $total = (int) ($countRow['cnt'] ?? 0);
+        $pages = max(1, (int) ceil($total / $perPage));
+        if ($page > $pages) {
+            $page = $pages;
+        }
+        $offset = ($page - 1) * $perPage;
+
+        $items = $this->fetchAll(
+            "SELECT o.* FROM shop_orders o WHERE {$where} ORDER BY o.id DESC LIMIT {$perPage} OFFSET {$offset}",
+            $params
+        );
+        $this->attachOrderItems($items);
+
+        return ['items' => $items, 'total' => $total, 'page' => $page, 'pages' => $pages, 'per_page' => $perPage];
+    }
+
+    /** @return array<string, int> */
+    public function orderStatusCounts(array $filters = []): array
+    {
+        $countFilters = $filters;
+        unset($countFilters['status']);
+        [$where, $params] = $this->orderFilterClause($countFilters);
+        $rows = $this->fetchAll(
+            "SELECT o.status, COUNT(*) AS cnt FROM shop_orders o WHERE {$where} GROUP BY o.status",
+            $params
+        );
+        $counts = [
+            'all' => 0,
+            'pending' => 0,
+            'paid' => 0,
+            'preparing' => 0,
+            'shipping' => 0,
+            'delivered' => 0,
+            'cancelled' => 0,
+            'refunded' => 0,
+        ];
+        foreach ($rows as $row) {
+            $key = (string) ($row['status'] ?? '');
+            $n = (int) ($row['cnt'] ?? 0);
+            if (isset($counts[$key])) {
+                $counts[$key] = $n;
+            }
+            $counts['all'] += $n;
+        }
+        return $counts;
+    }
+
+    public function findAdminOrder(int $id): ?array
+    {
+        $row = $this->fetchOne('SELECT * FROM shop_orders WHERE id = :id LIMIT 1', ['id' => $id]);
+        if (!$row) {
+            return null;
+        }
+        $items = [$row];
+        $this->attachOrderItems($items);
+        return $items[0];
+    }
+
+    /**
+     * @param array<int, array<string, mixed>> $orders
+     */
+    private function attachOrderItems(array &$orders): void
+    {
+        if ($orders === []) {
+            return;
+        }
+        $ids = [];
+        foreach ($orders as $row) {
+            $ids[] = (int) ($row['id'] ?? 0);
+        }
+        $ids = array_values(array_filter($ids));
+        if ($ids === []) {
+            return;
+        }
+        $placeholders = [];
+        $params = [];
+        foreach ($ids as $i => $id) {
+            $key = 'oid' . $i;
+            $placeholders[] = ':' . $key;
+            $params[$key] = $id;
+        }
+        $rows = $this->fetchAll(
+            'SELECT * FROM shop_order_items WHERE order_id IN (' . implode(',', $placeholders) . ') ORDER BY id ASC',
+            $params
+        );
+        $grouped = [];
+        foreach ($rows as $item) {
+            $grouped[(int) $item['order_id']][] = $item;
+        }
+        foreach ($orders as &$order) {
+            $oid = (int) ($order['id'] ?? 0);
+            $order['items'] = $grouped[$oid] ?? [];
+            $order['item_count'] = count($order['items']);
+            $order['item_qty'] = 0;
+            foreach ($order['items'] as $item) {
+                $order['item_qty'] += (int) ($item['qty'] ?? 0);
+            }
+        }
+        unset($order);
+    }
+
+    /** @return array{0:string,1:array<string,mixed>} */
+    private function orderFilterClause(array $filters): array
+    {
+        $where = '1=1';
+        $params = [];
+
+        $status = trim((string) ($filters['status'] ?? ''));
+        if ($status === 'cancel_group') {
+            $where .= " AND o.status IN ('cancelled','refunded')";
+        } elseif ($status !== '') {
+            $where .= ' AND o.status = :status';
+            $params['status'] = $status;
+        }
+
+        $payment = trim((string) ($filters['payment_status'] ?? ''));
+        if ($payment !== '') {
+            $where .= ' AND o.payment_status = :payment_status';
+            $params['payment_status'] = $payment;
+        }
+
+        if (!empty($filters['date_from'])) {
+            $where .= ' AND o.created_at >= :date_from';
+            $params['date_from'] = $filters['date_from'] . ' 00:00:00';
+        }
+        if (!empty($filters['date_to'])) {
+            $where .= ' AND o.created_at <= :date_to';
+            $params['date_to'] = $filters['date_to'] . ' 23:59:59';
+        }
+
+        if (!empty($filters['missing_tracking'])) {
+            $where .= " AND o.status IN ('paid','preparing','shipping') AND IFNULL(o.tracking_no,'') = ''";
+        }
+
+        $q = trim((string) ($filters['q'] ?? ''));
+        if ($q !== '') {
+            $where .= ' AND (
+                o.order_no LIKE :oq1 OR o.customer_name LIKE :oq2 OR o.customer_email LIKE :oq3
+                OR o.customer_phone LIKE :oq4 OR o.shipping_name LIKE :oq5 OR o.shipping_phone LIKE :oq6
+                OR o.tracking_no LIKE :oq7
+                OR EXISTS (
+                    SELECT 1 FROM shop_order_items i
+                    WHERE i.order_id = o.id AND (i.product_name LIKE :oq8 OR i.sku LIKE :oq9)
+                )
+            )';
+            $like = '%' . $q . '%';
+            foreach (range(1, 9) as $n) {
+                $params['oq' . $n] = $like;
+            }
+        }
+
+        return [$where, $params];
+    }
+
+    private function compatCodes(mixed $value): ?string
+    {
+        return ShopCompatHelper::normalize($value);
+    }
+
+    private function nullableText(mixed $value): ?string
+    {
+        $text = trim((string) ($value ?? ''));
+        return $text === '' ? null : $text;
+    }
+
+    /**
+     * @param array<string, mixed> $order
+     * @param array<int, array<string, mixed>> $items
+     * @return array{id:int,order_no:string}
+     */
+    public function createCustomerOrder(array $order, array $items): array
+    {
+        $this->db->beginTransaction();
+        try {
+            $orderNo = $this->nextOrderNo();
+            $now = date('Y-m-d H:i:s');
+            $this->execute(
+                'INSERT INTO shop_orders (
+                    order_no, user_id, customer_name, customer_email, customer_phone,
+                    status, payment_status, subtotal, shipping_fee, discount_amount, coupon_code, total_amount,
+                    shipping_name, shipping_phone, shipping_address, shipping_memo,
+                    created_at, updated_at
+                ) VALUES (
+                    :order_no, :user_id, :customer_name, :customer_email, :customer_phone,
+                    :status, :payment_status, :subtotal, :shipping_fee, :discount_amount, :coupon_code, :total_amount,
+                    :shipping_name, :shipping_phone, :shipping_address, :shipping_memo,
+                    :created_at, :updated_at
+                )',
+                [
+                    'order_no' => $orderNo,
+                    'user_id' => $order['user_id'] ?? null,
+                    'customer_name' => $order['customer_name'],
+                    'customer_email' => $order['customer_email'],
+                    'customer_phone' => $order['customer_phone'] ?? null,
+                    'status' => 'pending',
+                    'payment_status' => 'pending',
+                    'subtotal' => (int) ($order['subtotal'] ?? 0),
+                    'shipping_fee' => (int) ($order['shipping_fee'] ?? 0),
+                    'discount_amount' => (int) ($order['discount_amount'] ?? 0),
+                    'coupon_code' => $this->nullableText($order['coupon_code'] ?? null),
+                    'total_amount' => (int) ($order['total_amount'] ?? 0),
+                    'shipping_name' => $order['shipping_name'] ?? $order['customer_name'],
+                    'shipping_phone' => $order['shipping_phone'] ?? ($order['customer_phone'] ?? null),
+                    'shipping_address' => $order['shipping_address'] ?? null,
+                    'shipping_memo' => $order['shipping_memo'] ?? null,
+                    'created_at' => $now,
+                    'updated_at' => $now,
+                ]
+            );
+            $orderId = (int) $this->lastInsertId();
+            foreach ($items as $item) {
+                $optionId = (int) ($item['option_id'] ?? 0);
+                $this->execute(
+                    'INSERT INTO shop_order_items (order_id, product_id, option_id, product_name, sku, option_name, option_price_delta, qty, unit_price, line_total)
+                     VALUES (:order_id, :product_id, :option_id, :product_name, :sku, :option_name, :option_price_delta, :qty, :unit_price, :line_total)',
+                    [
+                        'order_id' => $orderId,
+                        'product_id' => (int) ($item['id'] ?? 0) ?: null,
+                        'option_id' => $optionId > 0 ? $optionId : null,
+                        'product_name' => (string) ($item['name'] ?? ''),
+                        'sku' => (string) ($item['sku'] ?? ''),
+                        'option_name' => $this->nullableText($item['option_name'] ?? null),
+                        'option_price_delta' => (int) ($item['option_price_delta'] ?? 0),
+                        'qty' => (int) ($item['qty'] ?? 1),
+                        'unit_price' => (int) ($item['unit_price'] ?? 0),
+                        'line_total' => (int) ($item['line_total'] ?? 0),
+                    ]
+                );
+                $pid = (int) ($item['id'] ?? 0);
+                $qty = (int) ($item['qty'] ?? 1);
+                if ($pid > 0 && $qty > 0) {
+                    $fresh = $this->findActiveProduct($pid);
+                    if ($fresh && (int) ($fresh['ink_amount'] ?? 0) > 0) {
+                        continue;
+                    }
+                    $left = max(0, (int) ($fresh['stock_qty'] ?? 0) - $qty);
+                    $this->execute(
+                        'UPDATE shop_products SET stock_qty = :qty, status = :status, updated_at = :now WHERE id = :id',
+                        [
+                            'qty' => $left,
+                            'status' => $left <= 0 ? 'soldout' : (string) ($fresh['status'] ?? 'active'),
+                            'now' => $now,
+                            'id' => $pid,
+                        ]
+                    );
+                }
+                if ($optionId > 0 && $qty > 0) {
+                    $this->execute(
+                        'UPDATE shop_product_options
+                         SET stock_qty = GREATEST(0, stock_qty - :qty), updated_at = :now
+                         WHERE id = :id AND product_id = :pid',
+                        ['qty' => $qty, 'now' => $now, 'id' => $optionId, 'pid' => $pid]
+                    );
+                }
+            }
+            $couponCode = strtoupper(trim((string) ($order['coupon_code'] ?? '')));
+            if ($couponCode !== '' && (int) ($order['discount_amount'] ?? 0) > 0) {
+                $this->incrementCouponUse($couponCode);
+            }
+            $this->db->commit();
+            return ['id' => $orderId, 'order_no' => $orderNo];
+        } catch (\Throwable $e) {
+            $this->db->rollBack();
+            throw $e;
+        }
+    }
+
+    /** @return array<string, mixed>|null */
+    /** @return array<int, array<string, mixed>> */
+    public function inkGrantRows(int $orderId): array
+    {
+        if ($orderId <= 0) {
+            return [];
+        }
+        return $this->fetchAll(
+            'SELECT o.user_id, o.order_no, i.qty, i.product_name, p.ink_amount
+             FROM shop_orders o
+             INNER JOIN shop_order_items i ON i.order_id = o.id
+             INNER JOIN shop_products p ON p.id = i.product_id
+             WHERE o.id = :id AND p.ink_amount > 0',
+            ['id' => $orderId]
+        );
+    }
+
+    public function findOrderByNo(string $orderNo): ?array
+    {
+        $orderNo = trim($orderNo);
+        if ($orderNo === '') {
+            return null;
+        }
+        $row = $this->fetchOne(
+            'SELECT * FROM shop_orders WHERE order_no = :no LIMIT 1',
+            ['no' => $orderNo]
+        );
+        return $row ?: null;
+    }
+
+    /**
+     * @param array{
+     *   payment_key:string,
+     *   payment_method:string,
+     *   payment_payload?:string|null,
+     *   raw?:array<string,mixed>
+     * } $payment
+     */
+    public function markOrderPaid(int $orderId, array $payment): void
+    {
+        $now = date('Y-m-d H:i:s');
+        $payload = $payment['payment_payload'] ?? null;
+        if ($payload === null && isset($payment['raw']) && is_array($payment['raw'])) {
+            $raw = $payment['raw'];
+            $payload = json_encode([
+                'paymentKey' => $raw['paymentKey'] ?? null,
+                'method' => $raw['method'] ?? null,
+                'easyPay' => $raw['easyPay'] ?? null,
+                'card' => isset($raw['card']) ? [
+                    'company' => $raw['card']['company'] ?? null,
+                    'number' => $raw['card']['number'] ?? null,
+                ] : null,
+                'approvedAt' => $raw['approvedAt'] ?? null,
+                'totalAmount' => $raw['totalAmount'] ?? null,
+                'status' => $raw['status'] ?? null,
+            ], JSON_UNESCAPED_UNICODE);
+        }
+
+        try {
+            $this->execute(
+                'UPDATE shop_orders SET
+                    status = CASE WHEN status IN (\'pending\',\'cancelled\') THEN \'paid\' ELSE status END,
+                    payment_status = \'paid\',
+                    payment_provider = :provider,
+                    payment_method = :method,
+                    payment_key = :payment_key,
+                    payment_payload = :payload,
+                    paid_at = :paid_at,
+                    updated_at = :now
+                 WHERE id = :id AND payment_status <> \'paid\'',
+                [
+                    'provider' => 'toss',
+                    'method' => (string) ($payment['payment_method'] ?? '토스페이먼츠'),
+                    'payment_key' => (string) ($payment['payment_key'] ?? ''),
+                    'payload' => $payload,
+                    'paid_at' => $now,
+                    'now' => $now,
+                    'id' => $orderId,
+                ]
+            );
+        } catch (\Throwable $e) {
+            $this->execute(
+                'UPDATE shop_orders SET
+                    status = CASE WHEN status IN (\'pending\',\'cancelled\') THEN \'paid\' ELSE status END,
+                    payment_status = \'paid\',
+                    updated_at = :now
+                 WHERE id = :id',
+                ['now' => $now, 'id' => $orderId]
+            );
+        }
+    }
+
+    public function markOrderPaymentFailed(int $orderId, ?string $reason = null): void
+    {
+        $now = date('Y-m-d H:i:s');
+        $memo = $reason !== null && $reason !== ''
+            ? mb_substr('결제실패: ' . $reason, 0, 500)
+            : null;
+        try {
+            $this->execute(
+                'UPDATE shop_orders SET
+                    payment_status = \'failed\',
+                    admin_memo = CASE
+                        WHEN :memo IS NULL THEN admin_memo
+                        WHEN admin_memo IS NULL OR admin_memo = \'\' THEN :memo2
+                        ELSE CONCAT(admin_memo, \'\\n\', :memo3)
+                    END,
+                    updated_at = :now
+                 WHERE id = :id AND payment_status = \'pending\'',
+                [
+                    'memo' => $memo,
+                    'memo2' => $memo,
+                    'memo3' => $memo,
+                    'now' => $now,
+                    'id' => $orderId,
+                ]
+            );
+        } catch (\Throwable) {
+            $this->execute(
+                'UPDATE shop_orders SET payment_status = \'failed\', updated_at = :now WHERE id = :id AND payment_status = \'pending\'',
+                ['now' => $now, 'id' => $orderId]
+            );
+        }
+    }
+
+    private function nextOrderNo(): string
+    {
+        $prefix = 'LU' . date('Ymd');
+        $row = $this->fetchOne(
+            'SELECT order_no FROM shop_orders WHERE order_no LIKE :prefix ORDER BY order_no DESC LIMIT 1',
+            ['prefix' => $prefix . '%']
+        );
+        $seq = 1;
+        if ($row && preg_match('/(\d{4})$/', (string) ($row['order_no'] ?? ''), $m)) {
+            $seq = ((int) $m[1]) + 1;
+        }
+        return $prefix . str_pad((string) $seq, 4, '0', STR_PAD_LEFT);
+    }
+
+    public static function normalizePaperKind(mixed $kind, string $hint = '', string $extra = ''): string
+    {
+        $raw = strtolower(trim((string) $kind));
+        if ($raw === 'tag') {
+            return 'tag';
+        }
+        if ($raw === 'label') {
+            return 'label';
+        }
+        $hay = mb_strtolower($hint . ' ' . $extra);
+        if (
+            str_contains($hay, '태그')
+            || str_contains($hay, '행택')
+            || preg_match('/(?<![a-z])tag(?![a-z])/u', $hay)
+            || str_contains($hay, 'hangtag')
+        ) {
+            return 'tag';
+        }
+        return 'label';
+    }
+
+}

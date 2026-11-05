@@ -1,0 +1,617 @@
+<?php
+
+declare(strict_types=1);
+
+function app_config(?string $key = null, mixed $default = null): mixed
+{
+    $config = $GLOBALS['APP_CONFIG'] ?? [];
+    if ($key === null) {
+        return $config;
+    }
+    return $config[$key] ?? $default;
+}
+
+function base_path(string $path = ''): string
+{
+    return rtrim(APP_ROOT, '/\\') . ($path ? '/' . ltrim($path, '/') : '');
+}
+
+function storage_path(string $path = ''): string
+{
+    return base_path('storage' . ($path ? '/' . ltrim($path, '/') : ''));
+}
+
+function public_path(string $path = ''): string
+{
+    // PHPS 호스팅: 문서루트는 www/, 로컬·구서버는 public/
+    static $docRoot = null;
+    if ($docRoot === null) {
+        $www = base_path('www');
+        $public = base_path('public');
+        if (is_dir($www)) {
+            $docRoot = $www;
+        } elseif (is_dir($public)) {
+            $docRoot = $public;
+        } else {
+            $docRoot = $public;
+        }
+    }
+
+    return rtrim($docRoot, '/\\') . ($path ? '/' . ltrim($path, '/') : '');
+}
+
+function view_path(string $path = ''): string
+{
+    return base_path('views' . ($path ? '/' . ltrim($path, '/') : ''));
+}
+
+function url(string $path = ''): string
+{
+    $base = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '')), '/');
+    if ($base === '/') {
+        $base = '';
+    }
+    return $base . '/' . ltrim($path, '/');
+}
+
+/** 인쇄용 QR 쿠폰 링크 기본 도메인. */
+function qr_public_url(string $path = '', array $query = []): string
+{
+    $base = rtrim((string) app_config('qr_public_url', 'https://www.labelup.co.kr'), '/');
+    if ($base === '') {
+        $base = 'https://www.labelup.co.kr';
+    }
+    $url = $base . '/' . ltrim($path, '/');
+    if ($query !== []) {
+        $url .= (str_contains($url, '?') ? '&' : '?') . http_build_query($query, '', '&', PHP_QUERY_RFC3986);
+    }
+    return $url;
+}
+
+/** 절대 URL (현재 요청 호스트 / APP_URL). 관리자 미리보기용. */
+function absolute_url(string $path = ''): string
+{
+    $path = trim($path);
+    if ($path !== '' && preg_match('#^https?://#i', $path)) {
+        return $path;
+    }
+
+    $query = '';
+    if ($path !== '' && str_contains($path, '?')) {
+        [$path, $queryPart] = explode('?', $path, 2);
+        $query = '?' . $queryPart;
+    }
+
+    $path = trim(str_replace('\\', '/', $path), '/');
+
+    // 브라우저 요청이 있으면 그 스킴·호스트를 우선 (HTTPS 관리자에서 HTTP iframe 차단 방지)
+    $host = (string) ($_SERVER['HTTP_HOST'] ?? '');
+    if ($host !== '') {
+        $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+            || ((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https');
+        $base = ($https ? 'https://' : 'http://') . $host;
+    } else {
+        $base = rtrim((string) app_config('url', ''), '/');
+        if ($base === '') {
+            $base = 'http://localhost';
+        }
+    }
+
+    if ($path === '') {
+        return $base . '/' . ($query !== '' ? ltrim($query, '?') : '');
+    }
+
+    return $base . '/' . $path . $query;
+}
+
+function asset(string $path): string
+{
+    $rel = 'assets/' . ltrim($path, '/');
+    $file = public_path($rel);
+    $version = is_readable($file) ? (string) filemtime($file) : (string) time();
+    return url($rel . '?v=' . $version);
+}
+
+function css(string $path): string
+{
+    $rel = 'css/' . ltrim($path, '/');
+    $file = public_path($rel);
+    $version = is_readable($file) ? (string) filemtime($file) : (string) time();
+    return url($rel . '?v=' . $version);
+}
+
+function js(string $path): string
+{
+    $rel = 'js/' . ltrim($path, '/');
+    $file = public_path($rel);
+    $version = is_readable($file) ? (string) filemtime($file) : (string) time();
+    return url($rel . '?v=' . $version);
+}
+
+function view(string $template, array $data = []): void
+{
+    extract($data, EXTR_SKIP);
+    $file = view_path(str_replace('.', '/', $template) . '.php');
+    if (!is_readable($file)) {
+        throw new RuntimeException('View not found: ' . $template);
+    }
+    require $file;
+}
+
+function redirect(string $path): never
+{
+    if (preg_match('#^https?://#i', $path)) {
+        header('Location: ' . $path);
+        exit;
+    }
+    header('Location: ' . url($path));
+    exit;
+}
+
+function e(?string $value): string
+{
+    return htmlspecialchars((string) $value, ENT_QUOTES, 'UTF-8');
+}
+
+function example_prompt_chip_label(?string $label, string $fallback = '예시'): string
+{
+    $text = trim((string) $label);
+    $stripped = preg_replace('/^[^\p{L}\p{N}]+/u', '', $text);
+    $text = trim((string) $stripped);
+    return $text !== '' ? $text : $fallback;
+}
+
+/**
+ * shop_categories.name 이 인코딩 손실로 ???? 가 된 경우 slug로 복구한다.
+ */
+function shop_category_display_name(?string $name, ?string $slug = null): string
+{
+    static $bySlug = [
+        'logistics-label' => '다용도라벨',
+        'logistics-use' => '물류관리용',
+        'address-label' => '주소용',
+        'barcode-label' => '바코드용',
+        'index-label' => '인덱스용',
+        'government-doc' => '정부문서화일 라벨',
+        'gloss-label' => '광택 라벨',
+        'waterproof-label' => '방수 라벨',
+        'translucent-label' => '반투명 라벨',
+        'inkjet-clear-label' => '잉크젯 투명 라벨',
+        'laser-clear-label' => '레이저 투명 라벨',
+        'protective-film' => '보호용 필름',
+        'color-label' => '컬러 라벨(형광)',
+        'pastel-color-label' => '파스텔 컬러 라벨',
+        'kraft-label' => '크라프트 라벨',
+        'ink-charge' => '잉크충전',
+    ];
+
+    $name = trim((string) $name);
+    $slug = trim((string) $slug);
+    if ($name !== '' && preg_match('/[\x{AC00}-\x{D7A3}]/u', $name)) {
+        return $name;
+    }
+    if ($slug !== '' && isset($bySlug[$slug])) {
+        return $bySlug[$slug];
+    }
+    return $name;
+}
+
+/**
+ * Admin pagination page window (centered around current when possible).
+ * @return list<int>
+ */
+function admin_pagination_window(int $page, int $pages, int $window = 7): array
+{
+    $page = max(1, $page);
+    $pages = max(1, $pages);
+    $window = max(1, $window);
+    if ($pages <= $window) {
+        return range(1, $pages);
+    }
+    $half = intdiv($window, 2);
+    $start = max(1, $page - $half);
+    $end = min($pages, $start + $window - 1);
+    $start = max(1, $end - $window + 1);
+
+    return range($start, $end);
+}
+
+function format_ai_krw(float|int|string|null $amount): string
+{
+    $n = (float) $amount;
+    if ($n <= 0) {
+        return '0';
+    }
+    if ($n < 1) {
+        $text = rtrim(rtrim(number_format($n, 4, '.', ''), '0'), '.');
+        return $text === '' ? '0' : $text;
+    }
+    if (abs($n - round($n)) < 0.005) {
+        return number_format((int) round($n));
+    }
+    return number_format($n, 2);
+}
+
+/** 라벨 규격(mm). 소수 둘째 자리에서 반올림해 한 자리까지 표시(불필요한 0은 생략). */
+function format_label_mm(float|int|string|null $mm): string
+{
+    if ($mm === null || $mm === '') {
+        return '';
+    }
+    $n = round((float) $mm, 1);
+    if (!is_finite($n)) {
+        return '';
+    }
+    $text = number_format($n, 1, '.', '');
+    $text = rtrim(rtrim($text, '0'), '.');
+    return $text === '' ? '0' : $text;
+}
+
+/**
+ * Build admin pagination href for a page number.
+ * @param array<string, scalar|null> $params query params excluding page
+ */
+function admin_pagination_href(string $basePath, array $params, int $page): string
+{
+    $query = [];
+    foreach ($params as $key => $value) {
+        if ($value === null || $value === '' || $value === false) {
+            continue;
+        }
+        $query[$key] = $value;
+    }
+    if ($page > 1) {
+        $query['page'] = $page;
+    }
+    $qs = http_build_query($query);
+
+    return url($basePath) . ($qs !== '' ? '?' . $qs : '');
+}
+
+function request_method(): string
+{
+    return strtoupper($_SERVER['REQUEST_METHOD'] ?? 'GET');
+}
+
+function request_json(): array
+{
+    $raw = file_get_contents('php://input');
+    if (!$raw) {
+        return [];
+    }
+    $decoded = json_decode($raw, true);
+    return is_array($decoded) ? $decoded : [];
+}
+
+function request_input(string $key, mixed $default = null): mixed
+{
+    if (isset($_POST[$key])) {
+        return $_POST[$key];
+    }
+    if (isset($_GET[$key])) {
+        return $_GET[$key];
+    }
+    $json = request_json();
+    return $json[$key] ?? $default;
+}
+
+function credit_balance_for_user(?array $authUser): int
+{
+    if (empty($authUser['id'])) {
+        return 0;
+    }
+    return (new \App\Services\CreditService())->balance((int) $authUser['id']);
+}
+
+/** @return array{id:int,name:string,slug:string,description:string,color:string,is_default:int,is_active:int}|null */
+function member_grade_for_user(?array $authUser): ?array
+{
+    if (empty($authUser['id'])) {
+        return null;
+    }
+    return (new \App\Services\MemberGradeService())->forUser((int) $authUser['id']);
+}
+
+function safe_redirect_path(string $path, string $fallback = '/'): string
+{
+    $path = trim($path);
+    if ($path === '' || !str_starts_with($path, '/') || str_starts_with($path, '//')) {
+        return $fallback;
+    }
+    return $path;
+}
+
+/** @return array<int, array{key:string,label:string,href:string,group:string,ic:string}> */
+function admin_menu_catalog(): array
+{
+    return [
+        ['key' => 'dashboard', 'label' => '대시보드', 'href' => 'admin', 'group' => '홈', 'ic' => '▣'],
+        ['key' => 'shop-categories', 'label' => '카테고리', 'href' => 'admin/shop/categories', 'group' => '쇼핑몰운영', 'ic' => '▦'],
+        ['key' => 'shop-specs', 'label' => '라벨 규격', 'href' => 'admin/shop/specs', 'group' => '쇼핑몰운영', 'ic' => '▣'],
+        ['key' => 'shop-products', 'label' => '상품 관리', 'href' => 'admin/shop/products', 'group' => '쇼핑몰운영', 'ic' => '◇'],
+        ['key' => 'shop-orders', 'label' => '주문 관리', 'href' => 'admin/shop/orders', 'group' => '쇼핑몰운영', 'ic' => '◎'],
+        ['key' => 'shop-shipping', 'label' => '배송 관리', 'href' => 'admin/shop/shipping', 'group' => '쇼핑몰운영', 'ic' => '▷'],
+        ['key' => 'shop-coupons', 'label' => '쿠폰·프로모션', 'href' => 'admin/shop/coupons', 'group' => '쇼핑몰운영', 'ic' => '◈'],
+        ['key' => 'shop-banners', 'label' => '배너·전시', 'href' => 'admin/shop/banners', 'group' => '쇼핑몰운영', 'ic' => '▣'],
+        ['key' => 'content-cliparts', 'label' => '클립아트관리', 'href' => 'admin/content/cliparts', 'group' => '컨텐츠관리', 'ic' => '✦'],
+        ['key' => 'content-user-designs', 'label' => '사용자디자인', 'href' => 'admin/content/user-designs', 'group' => '컨텐츠관리', 'ic' => '★'],
+        ['key' => 'content-templates', 'label' => '템플릿관리', 'href' => 'admin/content/templates', 'group' => '컨텐츠관리', 'ic' => '▦'],
+        ['key' => 'content-product-detail-pages', 'label' => '상세페이지관리', 'href' => 'admin/content/product-detail-pages', 'group' => '컨텐츠관리', 'ic' => '▣'],
+        ['key' => 'ai-credit-settings', 'label' => 'AI 잉크 설정', 'href' => 'admin/ai/credit-settings', 'group' => 'AI 관리', 'ic' => 'C'],
+        ['key' => 'ai-example-prompts', 'label' => '예시프롬프트 관리', 'href' => 'admin/ai/example-prompts', 'group' => 'AI 관리', 'ic' => '✦'],
+        ['key' => 'ai-token-logs', 'label' => '토큰사용로그', 'href' => 'admin/ai/token-logs', 'group' => 'AI 관리', 'ic' => '◎'],
+        ['key' => 'ai-member-usage', 'label' => '회원별 사용', 'href' => 'admin/ai/member-usage', 'group' => 'AI 관리', 'ic' => '◇'],
+        ['key' => 'ai-usage', 'label' => '사용량 통계', 'href' => 'admin/ai/usage', 'group' => 'AI 관리', 'ic' => '▣'],
+        ['key' => 'users', 'label' => '회원 관리', 'href' => 'admin/users', 'group' => '운영관리', 'ic' => '◎'],
+        ['key' => 'ops-credit-grants', 'label' => '잉크지급이력', 'href' => 'admin/ops/credit-grants', 'group' => '운영관리', 'ic' => '◈'],
+        ['key' => 'settings', 'label' => '운영설정', 'href' => 'admin/settings', 'group' => '운영관리', 'ic' => '⚙'],
+        ['key' => 'ops-hero-slides', 'label' => '히어로 이미지 관리', 'href' => 'admin/ops/hero-slides', 'group' => '운영관리', 'ic' => '▦'],
+        ['key' => 'ops-mid-banners', 'label' => '중간배너 관리', 'href' => 'admin/ops/mid-banners', 'group' => '운영관리', 'ic' => '▣'],
+        ['key' => 'ops-event-popups', 'label' => '이벤트 팝업관리', 'href' => 'admin/ops/event-popups', 'group' => '운영관리', 'ic' => '◎'],
+        ['key' => 'ops-faq', 'label' => 'FAQ 관리', 'href' => 'admin/ops/faq', 'group' => '운영관리', 'ic' => '?'],
+        ['key' => 'ops-reviews', 'label' => '리뷰관리', 'href' => 'admin/ops/reviews', 'group' => '운영관리', 'ic' => '★'],
+        ['key' => 'ops-inquiries', 'label' => '1:1 문의', 'href' => 'admin/ops/inquiries', 'group' => '운영관리', 'ic' => '✉'],
+        ['key' => 'ops-error-reports', 'label' => '오류&제안관리', 'href' => 'admin/ops/error-reports', 'group' => '운영관리', 'ic' => '!'],
+        ['key' => 'ops-credit-rewards', 'label' => '잉크보상 관리', 'href' => 'admin/ops/credit-rewards', 'group' => '운영관리', 'ic' => '◈'],
+        ['key' => 'ops-credit-usage', 'label' => '잉크 사용 설정', 'href' => 'admin/ops/credit-usage', 'group' => '운영관리', 'ic' => 'C'],
+        ['key' => 'ops-purchase-credits', 'label' => '구매잉크', 'href' => 'admin/ops/purchase-credits', 'group' => '운영관리', 'ic' => '▣'],
+        ['key' => 'settings-admins', 'label' => '관리자', 'href' => 'admin/settings/admins', 'group' => '설정', 'ic' => '⚙'],
+        ['key' => 'settings-member-grades', 'label' => '회원등급 설정', 'href' => 'admin/settings/member-grades', 'group' => '설정', 'ic' => '◇'],
+        ['key' => 'settings-environment', 'label' => '환경설정', 'href' => 'admin/settings/environment', 'group' => '설정', 'ic' => '◐'],
+        ['key' => 'settings-intro', 'label' => '인트로설정', 'href' => 'admin/settings/intro', 'group' => '설정', 'ic' => '▶'],
+        ['key' => 'settings-seo', 'label' => 'SEO 설정', 'href' => 'admin/settings/seo', 'group' => '설정', 'ic' => '◎'],
+        ['key' => 'settings-tracking', 'label' => '광고 스크립트', 'href' => 'admin/settings/tracking', 'group' => '설정', 'ic' => '◈'],
+        ['key' => 'settings-notify-sms', 'label' => '알림 설정 › 문자알림 설정', 'href' => 'admin/settings/notify-sms', 'group' => '설정', 'ic' => '✉'],
+        ['key' => 'partners', 'label' => '협력사 관리', 'href' => 'admin/partners', 'group' => '협력사', 'ic' => '◇'],
+        ['key' => 'qr-coupons', 'label' => 'QR쿠폰관리', 'href' => 'admin/qr-coupons', 'group' => 'QR쿠폰', 'ic' => '▦'],
+    ];
+}
+
+function admin_menu_by_key(string $key): ?array
+{
+    foreach (admin_menu_catalog() as $item) {
+        if ($item['key'] === $key) {
+            return $item;
+        }
+    }
+    return null;
+}
+
+function admin_can_menu(string $key): bool
+{
+    static $cache = null;
+    if ($cache === null) {
+        $auth = new \App\Services\AuthService();
+        $id = (int) ($auth->adminId() ?? 0);
+        $cache = ['super' => false, 'keys' => ['dashboard']];
+        if ($id > 0) {
+            try {
+                $svc = new \App\Services\AdminAccessService();
+                $cache['super'] = $svc->isSuper($id);
+                $cache['keys'] = $svc->allowedKeys($id);
+            } catch (\Throwable) {
+                $cache['super'] = true;
+            }
+        }
+    }
+    if ($key === 'dashboard' || $cache['super']) {
+        return true;
+    }
+    return in_array($key, $cache['keys'], true);
+}
+
+/** @param array<int, array<string, mixed>> $items */
+function admin_filter_menu_items(array $items): array
+{
+    return array_values(array_filter(
+        $items,
+        static fn (array $item): bool => admin_can_menu((string) ($item['key'] ?? ''))
+    ));
+}
+
+/**
+ * 사이드바와 동일한 카탈로그를 그룹 순서로 묶는다.
+ * @return array<string, array<int, array{key:string,label:string,href:string,group:string,ic:string}>>
+ */
+function admin_menu_groups(bool $excludeDashboard = true): array
+{
+    $groups = [];
+    foreach (admin_menu_catalog() as $item) {
+        if ($excludeDashboard && ($item['key'] ?? '') === 'dashboard') {
+            continue;
+        }
+        if (!admin_can_menu((string) ($item['key'] ?? ''))) {
+            continue;
+        }
+        $group = (string) ($item['group'] ?? '기타');
+        $groups[$group][] = $item;
+    }
+    return $groups;
+}
+
+/**
+ * @param array<string, mixed> $override
+ */
+function seo_render_head(?string $pageKey = null, array $override = []): void
+{
+    try {
+        echo (new \App\Services\SeoService())->headHtml($pageKey, $override);
+    } catch (\Throwable) {
+        $title = (string) ($override['title'] ?? $override['fallback_title'] ?? '라벨업 LABEL UP');
+        echo '<title>' . e($title) . '</title>' . "\n";
+    }
+}
+
+function marketing_render_head(): void
+{
+    try {
+        echo (new \App\Services\SeoService())->marketingHeadHtml();
+    } catch (\Throwable) {
+    }
+}
+
+function marketing_render_body_start(): void
+{
+    try {
+        echo (new \App\Services\SeoService())->marketingBodyStartHtml();
+    } catch (\Throwable) {
+    }
+}
+
+function marketing_render_body_end(): void
+{
+    try {
+        echo (new \App\Services\SeoService())->marketingBodyEndHtml();
+    } catch (\Throwable) {
+    }
+    site_intro_render();
+}
+
+function site_intro_render(): void
+{
+    try {
+        $payload = (new \App\Services\SiteIntroService())->activeForSite();
+        if ($payload === null) {
+            return;
+        }
+        $cfg = [
+            'enabled' => true,
+            'source_type' => $payload['source_type'],
+            'youtube_id' => $payload['youtube_id'],
+            'video_url' => $payload['video_url'],
+            'skip_label' => $payload['skip_label'],
+            'labiIconUrl' => asset('labi-icon.png'),
+            'logoUrl' => asset('logo.png'),
+        ];
+        echo '<link rel="stylesheet" href="' . e(css('site-intro.css')) . '">';
+        echo '<script>window.LABELUP_SITE_INTRO=' . json_encode($cfg, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) . ';</script>';
+        echo '<script src="' . e(js('site-intro.js')) . '"></script>';
+    } catch (\Throwable) {
+    }
+}
+
+/** @return array<string, string> */
+function company_info(): array
+{
+    try {
+        return (new \App\Services\CompanyInfoService())->all();
+    } catch (\Throwable) {
+        return [
+            'name' => '라벨업',
+            'ceo' => '',
+            'biz_no' => '',
+            'mail_order_no' => '',
+            'address' => '',
+            'phone' => '',
+            'email' => '',
+            'privacy_officer' => '',
+        ];
+    }
+}
+
+function render_site_footer(array $opts = []): void
+{
+    $year = (int) ($opts['year'] ?? date('Y'));
+    $links = $opts['links'] ?? null;
+    require view_path('partials/site-footer.php');
+}
+
+/** 이름 가운데 글자를 가린다. 두 글자는 뒤 글자, 세 글자 이상은 첫·끝만 남긴다. */
+function mask_person_name(?string $name): string
+{
+    $name = trim((string) $name);
+    if ($name === '') {
+        return '-';
+    }
+    $len = mb_strlen($name);
+    if ($len <= 1) {
+        return '*';
+    }
+    if ($len === 2) {
+        return mb_substr($name, 0, 1) . '*';
+    }
+
+    return mb_substr($name, 0, 1) . str_repeat('*', $len - 2) . mb_substr($name, -1);
+}
+
+/** 전화번호 숫자 중 가운데 네 자리를 가린다. 구분자(하이픈 등)는 그대로 둔다. */
+function mask_phone_middle(?string $phone): string
+{
+    $raw = trim((string) $phone);
+    if ($raw === '') {
+        return '-';
+    }
+    $chars = preg_split('//u', $raw, -1, PREG_SPLIT_NO_EMPTY);
+    if ($chars === false || $chars === []) {
+        return '-';
+    }
+    $digitPos = [];
+    foreach ($chars as $i => $ch) {
+        if (preg_match('/\d/', $ch) === 1) {
+            $digitPos[] = $i;
+        }
+    }
+    $len = count($digitPos);
+    if ($len === 0) {
+        return '-';
+    }
+    $maskCount = min(4, $len);
+    $start = intdiv($len - $maskCount, 2);
+    for ($k = $start; $k < $start + $maskCount; $k++) {
+        $chars[$digitPos[$k]] = '*';
+    }
+
+    return implode('', $chars);
+}
+
+/** 이메일 아이디(골뱅이 앞)만 일부를 가린다. 앞 두 글자를 남기고 나머지는 * 처리하며, 도메인은 그대로 둔다. */
+function mask_email_id(?string $email): string
+{
+    $email = trim((string) $email);
+    if ($email === '') {
+        return '-';
+    }
+    $at = mb_strpos($email, '@');
+    $local = $at === false ? $email : mb_substr($email, 0, $at);
+    $domain = $at === false ? '' : mb_substr($email, $at);
+    $len = mb_strlen($local);
+    if ($len <= 1) {
+        $maskedLocal = '*';
+    } elseif ($len === 2) {
+        $maskedLocal = mb_substr($local, 0, 1) . '*';
+    } else {
+        $maskedLocal = mb_substr($local, 0, 2) . str_repeat('*', $len - 2);
+    }
+
+    return $maskedLocal . $domain;
+}
+
+/** 회원 목록용. 원문은 출력하지 않고, 클릭 시 비밀번호 확인 후에만 조회한다. */
+function admin_masked_contact(int $userId, string $field, ?string $value): string
+{
+    if (!in_array($field, ['name', 'phone', 'email'], true)) {
+        $field = 'name';
+    }
+    $raw = trim((string) $value);
+    if ($userId <= 0 || $raw === '') {
+        return e('-');
+    }
+    if ($field === 'phone') {
+        $masked = mask_phone_middle($raw);
+        $label = '휴대폰';
+    } elseif ($field === 'email') {
+        $masked = mask_email_id($raw);
+        $label = '이메일';
+    } else {
+        $masked = mask_person_name($raw);
+        $label = '이름';
+    }
+
+    return '<button type="button" class="admin-pii js-pii-reveal"'
+        . ' data-user-id="' . $userId . '"'
+        . ' data-field="' . $field . '"'
+        . ' data-label="' . e($label) . '"'
+        . ' title="클릭 후 로그인 비밀번호를 입력하면 확인할 수 있습니다">'
+        . e($masked)
+        . '</button>';
+}

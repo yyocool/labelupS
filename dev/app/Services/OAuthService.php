@@ -1,0 +1,600 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Services;
+
+use App\Repositories\UserLoginLogRepository;
+use App\Repositories\UserOauthAccountRepository;
+use App\Repositories\UserProfileRepository;
+use App\Repositories\UserRepository;
+use RuntimeException;
+
+final class OAuthService
+{
+    public const PROVIDERS = ['naver', 'kakao', 'google'];
+
+    private UserRepository $users;
+    private UserProfileRepository $profiles;
+    private UserOauthAccountRepository $oauth;
+    private UserLoginLogRepository $loginLogs;
+    private string $afterLoginPath = '/account';
+
+    public function __construct()
+    {
+        $this->users = new UserRepository();
+        $this->profiles = new UserProfileRepository();
+        $this->oauth = new UserOauthAccountRepository();
+        $this->loginLogs = new UserLoginLogRepository();
+    }
+
+    public function isSupported(string $provider): bool
+    {
+        return in_array($provider, self::PROVIDERS, true);
+    }
+
+    public function isConfigured(string $provider): bool
+    {
+        if (!$this->isSupported($provider)) {
+            return false;
+        }
+        $cfg = $this->config($provider);
+        return $cfg['client_id'] !== '' && ($provider === 'kakao' || $cfg['client_secret'] !== '');
+    }
+
+    /** @return array<string, bool> */
+    public function configuredMap(): array
+    {
+        $map = [];
+        foreach (self::PROVIDERS as $p) {
+            $map[$p] = $this->isConfigured($p);
+        }
+        return $map;
+    }
+
+    public function authorizationUrl(string $provider, string $state): string
+    {
+        $cfg = $this->requireConfig($provider);
+        $redirectUri = $this->callbackUrl($provider);
+
+        return match ($provider) {
+            // implicit(token): PHPS WAF가 콜백 쿼리의 iss/https://googleapis.com 을 403 처리한다.
+            // access_token 은 fragment 로 오므로 서버/WAF 에 노출되지 않는다.
+            'google' => 'https://accounts.google.com/o/oauth2/v2/auth?' . http_build_query([
+                'client_id' => $cfg['client_id'],
+                'redirect_uri' => $redirectUri,
+                'response_type' => 'token',
+                'scope' => 'email profile',
+                'state' => $state,
+                'include_granted_scopes' => 'false',
+                'prompt' => 'select_account',
+            ], '', '&', PHP_QUERY_RFC3986),
+            'naver' => 'https://nid.naver.com/oauth2.0/authorize?' . http_build_query([
+                'response_type' => 'code',
+                'client_id' => $cfg['client_id'],
+                'redirect_uri' => $redirectUri,
+                'state' => $state,
+            ], '', '&', PHP_QUERY_RFC3986),
+            'kakao' => 'https://kauth.kakao.com/oauth/authorize?' . http_build_query([
+                'response_type' => 'code',
+                'client_id' => $cfg['client_id'],
+                'redirect_uri' => $redirectUri,
+                'state' => $state,
+                'scope' => 'profile_nickname,account_email',
+            ], '', '&', PHP_QUERY_RFC3986),
+            default => throw new RuntimeException('지원하지 않는 소셜 로그인입니다.'),
+        };
+    }
+
+    /**
+     * 문자인증이 켜져 있으면 신규 SNS 가입은 계정을 만들지 않고 null 을 반환한다.
+     *
+     * @return array{id:int,email:string,name:?string,role:string,status:string}|null
+     */
+    public function handleCallback(string $provider, string $code): ?array
+    {
+        return $this->completeWithToken($provider, $this->exchangeCode($provider, $code));
+    }
+
+    /**
+     * @return array{id:int,email:string,name:?string,role:string,status:string}|null
+     */
+    public function loginWithAccessToken(string $provider, string $accessToken, ?int $expiresIn = null): ?array
+    {
+        $token = ['access_token' => $accessToken];
+        if ($expiresIn !== null && $expiresIn > 0) {
+            $token['expires_in'] = $expiresIn;
+        }
+        return $this->completeWithToken($provider, $token);
+    }
+
+    public function setAfterLoginPath(string $path): void
+    {
+        $this->afterLoginPath = $path !== '' ? $path : '/account';
+    }
+
+    /**
+     * @return array{provider:string,provider_label:string,email:string,name:string}
+     */
+    public function pendingSignupSummary(): array
+    {
+        $pending = $this->requirePendingSignup();
+        return [
+            'provider' => (string) $pending['provider'],
+            'provider_label' => $this->providerLabel((string) $pending['provider']),
+            'email' => (string) $pending['email'],
+            'name' => (string) $pending['name'],
+        ];
+    }
+
+    /**
+     * @return array{id:int,email:string,name:?string,role:string,status:string,redirect:string}
+     */
+    public function completePendingSignup(string $phone, string $verifyToken): array
+    {
+        $verifiedPhone = (new SmsVerificationService())->consumeSignupToken($phone, $verifyToken);
+        return $this->finishPendingSignup($verifiedPhone);
+    }
+
+    /**
+     * @return array{id:int,email:string,name:?string,role:string,status:string,redirect:string}
+     */
+    public function completePendingSignupWithoutPhone(): array
+    {
+        return $this->finishPendingSignup(null);
+    }
+
+    /**
+     * @param array<string, mixed> $token
+     * @return array{id:int,email:string,name:?string,role:string,status:string}|null
+     */
+    private function completeWithToken(string $provider, array $token): ?array
+    {
+        $profile = $this->fetchProfile($provider, (string) ($token['access_token'] ?? ''));
+
+        $providerUserId = (string) ($profile['id'] ?? '');
+        if ($providerUserId === '') {
+            throw new RuntimeException('소셜 계정 정보를 확인하지 못했습니다.');
+        }
+
+        $email = $this->normalizeEmail((string) ($profile['email'] ?? ''), $provider, $providerUserId);
+        $name = trim((string) ($profile['name'] ?? '')) ?: $this->providerLabel($provider) . ' 회원';
+        $accessToken = (string) ($token['access_token'] ?? '');
+        $refreshToken = isset($token['refresh_token']) ? (string) $token['refresh_token'] : null;
+        $expiresAt = null;
+        if (isset($token['expires_in']) && is_numeric($token['expires_in'])) {
+            $expiresAt = date('Y-m-d H:i:s', time() + (int) $token['expires_in']);
+        }
+
+        $link = $this->oauth->findByProvider($provider, $providerUserId);
+        if ($link) {
+            $user = $this->users->findById((int) $link['user_id']);
+            if (!$user || ($user['status'] ?? '') !== 'active') {
+                throw new RuntimeException('연결된 계정을 사용할 수 없습니다. 고객센터로 문의해 주세요.');
+            }
+            $this->oauth->upsert(
+                (int) $user['id'],
+                $provider,
+                $providerUserId,
+                $email,
+                $accessToken !== '' ? $accessToken : null,
+                $refreshToken,
+                $expiresAt
+            );
+            $this->users->updateLastLogin((int) $user['id']);
+            $this->loginLogs->log((int) $user['id'], (string) $user['email'], true, 'oauth_' . $provider);
+            return $user;
+        }
+
+        $existingByEmail = $this->users->findByEmail($email);
+        if ($existingByEmail) {
+            if (($existingByEmail['status'] ?? '') !== 'active') {
+                throw new RuntimeException('해당 이메일 계정을 사용할 수 없습니다.');
+            }
+            $userId = (int) $existingByEmail['id'];
+            $this->oauth->upsert($userId, $provider, $providerUserId, $email, $accessToken ?: null, $refreshToken, $expiresAt);
+            $this->users->updateLastLogin($userId);
+            $this->loginLogs->log($userId, $email, true, 'oauth_link_' . $provider);
+            return $this->users->findById($userId) ?? $existingByEmail;
+        }
+
+        $safeName = mb_substr($name, 0, 100);
+        if (NaverSmsSettings::isSignupRequired()) {
+            $this->beginPendingSignup(
+                $provider,
+                $providerUserId,
+                $email,
+                $safeName,
+                $accessToken,
+                $refreshToken,
+                $expiresAt
+            );
+            return null;
+        }
+
+        return $this->createOauthUser(
+            $provider,
+            $providerUserId,
+            $email,
+            $safeName,
+            $accessToken,
+            $refreshToken,
+            $expiresAt,
+            null
+        );
+    }
+
+    /**
+     * @return array{id:int,email:string,name:?string,role:string,status:string,redirect:string}
+     */
+    private function finishPendingSignup(?string $phone): array
+    {
+        $pending = $this->requirePendingSignup();
+        $provider = (string) $pending['provider'];
+        $providerUserId = (string) $pending['provider_user_id'];
+        $email = (string) $pending['email'];
+        $name = (string) $pending['name'];
+        $accessToken = (string) ($pending['access_token'] ?? '');
+        $refreshToken = isset($pending['refresh_token']) && (string) $pending['refresh_token'] !== ''
+            ? (string) $pending['refresh_token']
+            : null;
+        $expiresAt = isset($pending['expires_at']) && (string) $pending['expires_at'] !== ''
+            ? (string) $pending['expires_at']
+            : null;
+        $redirect = (string) ($pending['redirect'] ?? '/account');
+
+        $link = $this->oauth->findByProvider($provider, $providerUserId);
+        if ($link) {
+            $user = $this->users->findById((int) $link['user_id']);
+            if (!$user || ($user['status'] ?? '') !== 'active') {
+                throw new RuntimeException('연결된 계정을 사용할 수 없습니다. 고객센터로 문의해 주세요.');
+            }
+            $this->clearPendingSignup();
+            $this->users->updateLastLogin((int) $user['id']);
+            $user['redirect'] = $redirect;
+            return $user;
+        }
+
+        $existing = $this->users->findByEmail($email);
+        if ($existing && !str_ends_with($email, '@oauth.labelup.local')) {
+            if (($existing['status'] ?? '') !== 'active') {
+                throw new RuntimeException('해당 이메일 계정을 사용할 수 없습니다.');
+            }
+            $userId = (int) $existing['id'];
+            $this->oauth->upsert($userId, $provider, $providerUserId, $email, $accessToken !== '' ? $accessToken : null, $refreshToken, $expiresAt);
+            $this->users->updateLastLogin($userId);
+            $this->loginLogs->log($userId, $email, true, 'oauth_link_' . $provider);
+            $this->clearPendingSignup();
+            $user = $this->users->findById($userId) ?? $existing;
+            $user['redirect'] = $redirect;
+            return $user;
+        }
+
+        $user = $this->createOauthUser(
+            $provider,
+            $providerUserId,
+            $email,
+            $name,
+            $accessToken,
+            $refreshToken,
+            $expiresAt,
+            $phone
+        );
+        $this->clearPendingSignup();
+        $user['redirect'] = $redirect;
+        return $user;
+    }
+
+    /**
+     * @return array{id:int,email:string,name:?string,role:string,status:string}
+     */
+    private function createOauthUser(
+        string $provider,
+        string $providerUserId,
+        string $email,
+        string $name,
+        string $accessToken,
+        ?string $refreshToken,
+        ?string $expiresAt,
+        ?string $phone
+    ): array {
+        $hash = password_hash(bin2hex(random_bytes(32)), PASSWORD_DEFAULT);
+        $userId = $this->users->create($email, $hash);
+        $this->profiles->create($userId, $name);
+        if ($phone !== null && $phone !== '') {
+            $this->profiles->update($userId, ['phone' => $phone]);
+        }
+        (new MemberGradeService())->assignDefault($userId);
+        $this->oauth->upsert($userId, $provider, $providerUserId, $email, $accessToken !== '' ? $accessToken : null, $refreshToken, $expiresAt);
+        $this->users->updateLastLogin($userId);
+        $this->loginLogs->log($userId, $email, true, 'oauth_register_' . $provider);
+        (new NotificationService())->notifyWelcome($userId, $name);
+        (new CreditService())->grantByTrigger($userId, 'signup');
+
+        $user = $this->users->findById($userId);
+        if (!$user) {
+            throw new RuntimeException('회원 생성에 실패했습니다.');
+        }
+        return $user;
+    }
+
+    private function beginPendingSignup(
+        string $provider,
+        string $providerUserId,
+        string $email,
+        string $name,
+        string $accessToken,
+        ?string $refreshToken,
+        ?string $expiresAt
+    ): void {
+        $_SESSION['oauth_pending_signup'] = [
+            'provider' => $provider,
+            'provider_user_id' => $providerUserId,
+            'email' => $email,
+            'name' => $name,
+            'access_token' => $accessToken,
+            'refresh_token' => $refreshToken,
+            'expires_at' => $expiresAt,
+            'redirect' => $this->afterLoginPath,
+            'created_at' => time(),
+        ];
+    }
+
+    /** @return array<string, mixed> */
+    private function requirePendingSignup(): array
+    {
+        $pending = $_SESSION['oauth_pending_signup'] ?? null;
+        if (!is_array($pending)) {
+            throw new RuntimeException('소셜 가입 정보가 없습니다. 소셜 로그인을 다시 진행해 주세요.');
+        }
+        $createdAt = (int) ($pending['created_at'] ?? 0);
+        if ($createdAt < 1 || (time() - $createdAt) > 1800) {
+            $this->clearPendingSignup();
+            throw new RuntimeException('소셜 가입 시간이 만료되었습니다. 다시 시도해 주세요.');
+        }
+        $provider = (string) ($pending['provider'] ?? '');
+        $providerUserId = (string) ($pending['provider_user_id'] ?? '');
+        $email = (string) ($pending['email'] ?? '');
+        if (!$this->isSupported($provider) || $providerUserId === '' || $email === '') {
+            $this->clearPendingSignup();
+            throw new RuntimeException('소셜 가입 정보가 올바르지 않습니다. 다시 시도해 주세요.');
+        }
+        return $pending;
+    }
+
+    private function clearPendingSignup(): void
+    {
+        unset($_SESSION['oauth_pending_signup']);
+    }
+
+    public function callbackUrl(string $provider): string
+    {
+        return $this->absoluteUrl('auth/' . $provider . '/callback');
+    }
+
+    public function publicClientId(string $provider): string
+    {
+        return $this->config($provider)['client_id'];
+    }
+
+    /** @return array{client_id:string,client_secret:string} */
+    private function config(string $provider): array
+    {
+        return match ($provider) {
+            'google' => [
+                'client_id' => trim((string) env('GOOGLE_CLIENT_ID', '')),
+                'client_secret' => trim((string) env('GOOGLE_CLIENT_SECRET', '')),
+            ],
+            'naver' => [
+                'client_id' => trim((string) env('NAVER_CLIENT_ID', '')),
+                'client_secret' => trim((string) env('NAVER_CLIENT_SECRET', '')),
+            ],
+            'kakao' => [
+                'client_id' => trim((string) env('KAKAO_REST_API_KEY', env('KAKAO_CLIENT_ID', ''))),
+                'client_secret' => trim((string) env('KAKAO_CLIENT_SECRET', '')),
+            ],
+            default => ['client_id' => '', 'client_secret' => ''],
+        };
+    }
+
+    /** @return array{client_id:string,client_secret:string} */
+    private function requireConfig(string $provider): array
+    {
+        if (!$this->isConfigured($provider)) {
+            throw new RuntimeException($this->providerLabel($provider) . ' 로그인 키가 아직 설정되지 않았습니다.');
+        }
+        return $this->config($provider);
+    }
+
+    /** @return array<string, mixed> */
+    private function exchangeCode(string $provider, string $code): array
+    {
+        $cfg = $this->requireConfig($provider);
+        $redirectUri = $this->callbackUrl($provider);
+
+        return match ($provider) {
+            'google' => $this->httpJson('POST', 'https://oauth2.googleapis.com/token', [
+                'code' => $code,
+                'client_id' => $cfg['client_id'],
+                'client_secret' => $cfg['client_secret'],
+                'redirect_uri' => $redirectUri,
+                'grant_type' => 'authorization_code',
+            ]),
+            'naver' => $this->httpJson('POST', 'https://nid.naver.com/oauth2.0/token', [
+                'grant_type' => 'authorization_code',
+                'client_id' => $cfg['client_id'],
+                'client_secret' => $cfg['client_secret'],
+                'code' => $code,
+                'state' => (string) ($_SESSION['oauth_state'] ?? ''),
+            ]),
+            'kakao' => $this->httpJson('POST', 'https://kauth.kakao.com/oauth/token', array_filter([
+                'grant_type' => 'authorization_code',
+                'client_id' => $cfg['client_id'],
+                'redirect_uri' => $redirectUri,
+                'code' => $code,
+                'client_secret' => $cfg['client_secret'] !== '' ? $cfg['client_secret'] : null,
+            ], static fn ($v) => $v !== null && $v !== '')),
+            default => throw new RuntimeException('지원하지 않는 소셜 로그인입니다.'),
+        };
+    }
+
+    /**
+     * @return array{id:string,email:?string,name:?string}
+     */
+    private function fetchProfile(string $provider, string $accessToken): array
+    {
+        if ($accessToken === '') {
+            throw new RuntimeException('액세스 토큰을 받지 못했습니다.');
+        }
+
+        if ($provider === 'google') {
+            $data = $this->httpJson('GET', 'https://openidconnect.googleapis.com/v1/userinfo', [], [
+                'Authorization: Bearer ' . $accessToken,
+            ]);
+            return [
+                'id' => (string) ($data['sub'] ?? $data['id'] ?? ''),
+                'email' => isset($data['email']) ? (string) $data['email'] : null,
+                'name' => (string) ($data['name'] ?? $data['given_name'] ?? ''),
+            ];
+        }
+
+        if ($provider === 'naver') {
+            $data = $this->httpJson('GET', 'https://openapi.naver.com/v1/nid/me', [], [
+                'Authorization: Bearer ' . $accessToken,
+            ]);
+            $resp = is_array($data['response'] ?? null) ? $data['response'] : [];
+            return [
+                'id' => (string) ($resp['id'] ?? ''),
+                'email' => isset($resp['email']) ? (string) $resp['email'] : null,
+                'name' => (string) ($resp['name'] ?? $resp['nickname'] ?? ''),
+            ];
+        }
+
+        // kakao
+        $data = $this->httpJson('GET', 'https://kapi.kakao.com/v2/user/me', [], [
+            'Authorization: Bearer ' . $accessToken,
+        ]);
+        $kakaoAccount = is_array($data['kakao_account'] ?? null) ? $data['kakao_account'] : [];
+        $profile = is_array($kakaoAccount['profile'] ?? null) ? $kakaoAccount['profile'] : [];
+        return [
+            'id' => (string) ($data['id'] ?? ''),
+            'email' => isset($kakaoAccount['email']) ? (string) $kakaoAccount['email'] : null,
+            'name' => (string) ($profile['nickname'] ?? ''),
+        ];
+    }
+
+    private function normalizeEmail(?string $email, string $provider, string $providerUserId): string
+    {
+        $email = strtolower(trim((string) $email));
+        if ($email !== '' && filter_var($email, FILTER_VALIDATE_EMAIL)) {
+            return $email;
+        }
+        return sprintf('%s_%s@oauth.labelup.local', $provider, preg_replace('/[^a-zA-Z0-9_-]/', '', $providerUserId));
+    }
+
+    public function providerLabel(string $provider): string
+    {
+        return match ($provider) {
+            'naver' => '네이버',
+            'kakao' => '카카오',
+            'google' => '구글',
+            default => $provider,
+        };
+    }
+
+    private function absoluteUrl(string $path): string
+    {
+        $host = strtolower((string) ($_SERVER['HTTP_HOST'] ?? ''));
+        $appUrl = rtrim((string) env('APP_URL', ''), '/');
+
+        // OAuth redirect_uri는 콘솔에 등록된 https 주소와 바이트 단위로 같아야 한다.
+        if ($host !== '' && (str_ends_with($host, 'labelup.co.kr') || str_contains($host, 'labelup.'))) {
+            $base = 'https://' . preg_replace('/:\d+$/', '', $host);
+        } elseif ($appUrl !== '') {
+            $base = $appUrl;
+            if (str_starts_with($base, 'http://') && (str_contains($base, 'labelup.co.kr') || str_contains($base, 'labelup.'))) {
+                $base = 'https://' . substr($base, strlen('http://'));
+            }
+        } elseif ($host !== '') {
+            $https = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+                || ((string) ($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https')
+                || ((string) ($_SERVER['SERVER_PORT'] ?? '') === '443');
+            $base = ($https ? 'https' : 'http') . '://' . $host;
+        } else {
+            $base = 'https://www.labelup.co.kr';
+        }
+
+        return rtrim($base, '/') . '/' . ltrim($path, '/');
+    }
+
+    /**
+     * @param array<string, scalar|null> $form
+     * @param array<int, string> $headers
+     * @return array<string, mixed>
+     */
+    private function httpJson(string $method, string $url, array $form = [], array $headers = []): array
+    {
+        $body = $form !== [] ? http_build_query($form) : null;
+        $method = strtoupper($method);
+
+        if (function_exists('curl_init')) {
+            $ch = curl_init($url);
+            $reqHeaders = array_merge(['Accept: application/json'], $headers);
+            if ($body !== null) {
+                $reqHeaders[] = 'Content-Type: application/x-www-form-urlencoded';
+            }
+            curl_setopt_array($ch, [
+                CURLOPT_CUSTOMREQUEST => $method,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_TIMEOUT => 30,
+                CURLOPT_HTTPHEADER => $reqHeaders,
+            ]);
+            if ($method !== 'GET' && $body !== null) {
+                curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+            }
+            $raw = curl_exec($ch);
+            $status = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $error = curl_error($ch);
+            curl_close($ch);
+            if ($raw === false) {
+                throw new RuntimeException('소셜 로그인 서버 연결 실패: ' . ($error ?: 'unknown'));
+            }
+        } else {
+            $hdr = "Accept: application/json\r\n";
+            foreach ($headers as $h) {
+                $hdr .= $h . "\r\n";
+            }
+            $opts = [
+                'http' => [
+                    'method' => $method,
+                    'header' => $hdr,
+                    'timeout' => 30,
+                    'ignore_errors' => true,
+                ],
+            ];
+            if ($body !== null && $method !== 'GET') {
+                $opts['http']['header'] .= "Content-Type: application/x-www-form-urlencoded\r\n";
+                $opts['http']['content'] = $body;
+            }
+            $raw = file_get_contents($url, false, stream_context_create($opts));
+            $status = 0;
+            if (isset($http_response_header[0]) && preg_match('#\s(\d{3})\s#', $http_response_header[0], $m)) {
+                $status = (int) $m[1];
+            }
+            if ($raw === false) {
+                throw new RuntimeException('소셜 로그인 서버 연결에 실패했습니다.');
+            }
+        }
+
+        $decoded = json_decode((string) $raw, true);
+        if (!is_array($decoded)) {
+            throw new RuntimeException('소셜 로그인 응답을 해석할 수 없습니다.');
+        }
+        if ($status >= 400 || isset($decoded['error']) || (($decoded['errorCode'] ?? '') !== '' && ($decoded['errorCode'] ?? '00') !== '00')) {
+            $msg = (string) ($decoded['error_description'] ?? $decoded['error_msg'] ?? $decoded['msg'] ?? $decoded['error'] ?? '소셜 로그인에 실패했습니다.');
+            throw new RuntimeException($msg);
+        }
+
+        return $decoded;
+    }
+}

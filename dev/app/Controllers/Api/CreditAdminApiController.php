@@ -1,0 +1,202 @@
+<?php
+
+declare(strict_types=1);
+
+namespace App\Controllers\Api;
+
+use App\Controllers\BaseController;
+use App\Middleware\AuthMiddleware;
+use App\Services\AiCreditService;
+use App\Services\AuthService;
+use App\Services\CreditAdminService;
+use App\Services\QrCouponAdminService;
+use RuntimeException;
+
+final class CreditAdminApiController extends BaseController
+{
+    private AuthService $auth;
+    private CreditAdminService $credits;
+
+    public function __construct()
+    {
+        $this->auth = new AuthService();
+        $this->credits = new CreditAdminService();
+    }
+
+    public function saveRewardRule(): never
+    {
+        $this->guard();
+        try {
+            $id = $this->credits->saveRewardRule(request_json());
+            $this->jsonSuccess(['id' => $id], '잉크 보상 규칙이 저장되었습니다.');
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    public function deleteRewardRule(): never
+    {
+        $this->guard();
+        $this->credits->deleteRewardRule((int) (request_json()['id'] ?? 0));
+        $this->jsonSuccess(null, '삭제되었습니다.');
+    }
+
+    public function savePurchaseProduct(): never
+    {
+        $this->guard();
+        try {
+            $id = $this->credits->savePurchaseProduct(request_json());
+            $this->jsonSuccess(['id' => $id], '구매잉크 제품이 저장되었습니다.');
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    public function deletePurchaseProduct(): never
+    {
+        $this->guard();
+        $this->credits->deletePurchaseProduct((int) (request_json()['id'] ?? 0));
+        $this->jsonSuccess(null, '삭제되었습니다.');
+    }
+
+    public function generateCodes(): never
+    {
+        $this->guard();
+        $data = request_json();
+        try {
+            $count = $this->credits->generateCodes(
+                (int) ($data['product_id'] ?? 0),
+                (int) ($data['count'] ?? 0),
+                (string) ($data['prefix'] ?? 'LU')
+            );
+            $this->jsonSuccess(['created' => $count], "{$count}개 코드가 생성되었습니다.");
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    public function adjustCredit(): never
+    {
+        $this->guard();
+        $data = request_json();
+        try {
+            $balance = $this->credits->adjustUserCredit(
+                (int) ($data['user_id'] ?? 0),
+                (int) ($data['amount'] ?? 0),
+                (string) ($data['description'] ?? '관리자 조정'),
+                (int) $this->auth->adminId()
+            );
+            $this->jsonSuccess(['balance' => $balance], '잉크가 조정되었습니다.');
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    public function grantCredit(): never
+    {
+        $this->guard();
+        $data = request_json();
+        $reason = trim((string) ($data['reason'] ?? $data['description'] ?? ''));
+        try {
+            $balance = $this->credits->grantUserCredit(
+                (int) ($data['user_id'] ?? 0),
+                (int) ($data['amount'] ?? 0),
+                $reason,
+                (int) $this->auth->adminId()
+            );
+            $this->jsonSuccess(['balance' => $balance], '잉크가 지급되었습니다.');
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    public function grantHistory(): never
+    {
+        $this->guard();
+        $userId = (int) ($_GET['user_id'] ?? 0);
+        if ($userId <= 0) {
+            $this->jsonError('회원을 지정해 주세요.', null, 422);
+        }
+        $page = max(1, (int) ($_GET['page'] ?? 1));
+        $perPage = max(1, min(50, (int) ($_GET['per_page'] ?? 30)));
+        $history = $this->credits->grantHistory($userId, $page, $perPage);
+        foreach ($history['items'] as &$row) {
+            $row['user_name'] = \mask_person_name((string) ($row['user_name'] ?? ''));
+            $row['user_email'] = \mask_email_id((string) ($row['user_email'] ?? ''));
+        }
+        unset($row);
+        $this->jsonSuccess($history);
+    }
+
+    public function saveCsLog(): never
+    {
+        $this->guard();
+        try {
+            $id = $this->credits->saveCsLog(request_json(), (int) $this->auth->adminId());
+            $this->jsonSuccess(['id' => $id], 'CS 이력이 저장되었습니다.');
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    /** 구매잉크/QR쿠폰 공통 — 그룹 지급 잉크 저장 */
+    public function savePurchaseGroupCredit(): never
+    {
+        $this->guard();
+        try {
+            $payload = request_json();
+            $saved = (new QrCouponAdminService())->saveCreditAmount(
+                (int) ($payload['group_no'] ?? 0),
+                $payload['credit_amount'] ?? null
+            );
+            $this->jsonSuccess($saved, '지급 잉크가 저장되었습니다. (QR쿠폰관리에도 동일 적용)');
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    /** 구매잉크 — 그룹별 지급 이력 */
+    public function purchaseGroupUsageHistory(): never
+    {
+        $this->guard();
+        try {
+            $groupNo = (int) (request_json()['group_no'] ?? 0);
+            $items = (new QrCouponAdminService())->usageHistory($groupNo);
+            $this->jsonSuccess(['items' => $items, 'group_no' => $groupNo]);
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    /** 운영관리 › 잉크 사용 설정 저장 */
+    public function saveCreditUsage(): never
+    {
+        $this->guard();
+        try {
+            (new AiCreditService())->saveAdminSettings(request_json());
+            $this->jsonSuccess(
+                (new AiCreditService())->adminSettings(),
+                '잉크 사용 설정이 저장되었습니다.'
+            );
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    /** 관리자 헤더용 전체 회원 잉크 현황 */
+    public function overview(): never
+    {
+        $this->guard();
+        $detail = !empty($_GET['detail']);
+        try {
+            $this->jsonSuccess($this->credits->overview($detail));
+        } catch (RuntimeException $e) {
+            $this->jsonError($e->getMessage(), null, 422);
+        }
+    }
+
+    private function guard(): void
+    {
+        (new AuthMiddleware($this->auth))->handle(true);
+    }
+}
